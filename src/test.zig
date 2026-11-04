@@ -2953,6 +2953,43 @@ test "hash map with u64 hashes" {
     }
 }
 
+test "hash map collision split preserves existing key on nested write error" {
+    const DB = xitdb.Database(.memory, u64);
+    var buffer = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer buffer.deinit();
+    var db = try DB.init(std.testing.io, .{ .buffer = &buffer });
+    const history = try DB.ArrayList(.read_write).init(db.rootCursor());
+
+    const Ctx = struct {
+        pub fn run(_: @This(), cursor: *DB.Cursor(.read_write)) !void {
+            const moment = try DB.HashMap(.read_write).init(cursor.*);
+            try moment.put(0, .{ .uint = 111 });
+
+            // Cap growth partway through splitting 15 shared nibbles, catch the
+            // failure inside this transaction, and still commit valid work.
+            const saved_max = cursor.db.core.max_size;
+            cursor.db.core.max_size = (try cursor.db.core.length()) + 144 * 4;
+            try std.testing.expectError(error.WriteFailed, moment.put(@as(u64, 1) << 60, .{ .uint = 222 }));
+            cursor.db.core.max_size = saved_max;
+
+            try moment.put(1, .{ .uint = 333 });
+        }
+    };
+    try history.appendContext(.{ .slot = null }, Ctx{});
+
+    const moment = try DB.HashMap(.read_only).init((try history.getCursor(0)).?);
+    try std.testing.expectEqual(111, try (try moment.getCursor(0)).?.readUint());
+    try std.testing.expectEqual(null, try moment.getCursor(@as(u64, 1) << 60));
+    try std.testing.expectEqual(333, try (try moment.getCursor(1)).?.readUint());
+
+    // A cyclic .index slot in the root block must return error.KeyOffsetExceeded
+    const map_slot = try (try history.getCursor(0)).?.slot();
+    var writer = db.core.writer();
+    try writer.seekTo(map_slot.value);
+    try writer.interface.writeInt(u72, @bitCast(xitdb.Slot{ .value = map_slot.value, .tag = .index }), .big);
+    try std.testing.expectError(error.KeyOffsetExceeded, moment.getCursor(0));
+}
+
 fn testCompaction(
     allocator: std.mem.Allocator,
     comptime db_kind: xitdb.DatabaseKind,
