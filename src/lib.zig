@@ -4650,27 +4650,26 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
 
                 fn populateIndex(self: *Self, source_offset: u64, target_offset: u64, _: void) anyerror!void {
                     var reader = self.source_core.reader();
-                    var writer = self.target_core.writer();
 
                     // read 144-byte block (16 slots)
                     try reader.seekTo(source_offset);
-                    var block_bytes: [INDEX_BLOCK_SIZE]u8 = @splat(0);
+                    var block_bytes: [INDEX_BLOCK_SIZE]u8 = undefined;
                     try reader.interface.readSliceAll(&block_bytes);
 
-                    // remap each slot
-                    var block_reader = std.Io.Reader.fixed(&block_bytes);
-                    var remapped_slots: [SLOT_COUNT]Slot = undefined;
-                    for (&remapped_slots) |*s| {
-                        const child_slot: Slot = @bitCast(try takeInt(&block_reader, SlotInt, .big));
+                    // remap each slot in place
+                    const slot_len = comptime byteSizeOf(Slot);
+                    for (0..SLOT_COUNT) |i| {
+                        const off = i * slot_len;
+                        const child_slot: Slot = @bitCast(std.mem.readInt(SlotInt, block_bytes[off..][0..slot_len], .big));
                         try child_slot.tag.validate();
-                        s.* = try self.remapSlot(child_slot);
+                        const remapped = try self.remapSlot(child_slot);
+                        std.mem.writeInt(SlotInt, block_bytes[off..][0..slot_len], @bitCast(remapped), .big);
                     }
 
-                    // write remapped block to target
+                    // write remapped block to target in one batch
+                    var writer = self.target_core.writer();
                     try writer.seekTo(target_offset);
-                    for (remapped_slots) |s| {
-                        try writer.interface.writeInt(SlotInt, @bitCast(s), .big);
-                    }
+                    try writer.interface.writeAll(&block_bytes);
                 }
 
                 fn remapArrayListIndex(self: *Self, source_offset: u64, size: u64, shift: u6) anyerror!u64 {
@@ -4686,28 +4685,33 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     const target_offset = try self.reserveBlock(INDEX_BLOCK_SIZE);
                     var reader = self.source_core.reader();
                     try reader.seekTo(source_offset);
-                    var slots: [SLOT_COUNT]Slot = @splat(.{});
+                    var in_bytes: [INDEX_BLOCK_SIZE]u8 = undefined;
+                    try reader.interface.readSliceAll(&in_bytes);
+
+                    var out_bytes: [INDEX_BLOCK_SIZE]u8 = @splat(0);
+                    const slot_len = comptime byteSizeOf(Slot);
                     var remaining = size;
-                    for (&slots) |*slot| {
+                    for (0..SLOT_COUNT) |i| {
                         if (remaining == 0) break;
-                        const child_slot: Slot = @bitCast(try takeInt(&reader.interface, SlotInt, .big));
+                        const off = i * slot_len;
+                        const child_slot: Slot = @bitCast(std.mem.readInt(SlotInt, in_bytes[off..][0..slot_len], .big));
                         try child_slot.tag.validate();
                         const count = @min(remaining, child_size);
-                        if (shift == 0) {
-                            slot.* = try self.remapSlot(child_slot);
-                        } else {
+                        const remapped: Slot = if (shift == 0)
+                            try self.remapSlot(child_slot)
+                        else blk: {
                             if (child_slot.tag != .index) return error.UnexpectedTag;
-                            slot.* = child_slot;
-                            slot.value = try self.remapArrayListIndex(child_slot.value, count, shift - 1);
-                        }
+                            var s = child_slot;
+                            s.value = try self.remapArrayListIndex(child_slot.value, count, shift - 1);
+                            break :blk s;
+                        };
+                        std.mem.writeInt(SlotInt, out_bytes[off..][0..slot_len], @bitCast(remapped), .big);
                         remaining -= count;
                     }
 
                     var writer = self.target_core.writer();
                     try writer.seekTo(target_offset);
-                    for (slots) |slot| {
-                        try writer.interface.writeInt(SlotInt, @bitCast(slot), .big);
-                    }
+                    try writer.interface.writeAll(&out_bytes);
                     return target_offset;
                 }
 
@@ -4769,54 +4773,51 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
 
                 fn populateBTreeLeaf(self: *Self, source_offset: u64, target_offset: u64, header: NodeHeader) anyerror!void {
                     var reader = self.source_core.reader();
-                    var writer = self.target_core.writer();
                     try reader.seekTo(source_offset + BTREE_NODE_HEADER_SIZE);
 
-                    var body: [BTREE_LEAF_BLOCK_SIZE - BTREE_NODE_HEADER_SIZE]u8 = @splat(0);
-                    try reader.interface.readSliceAll(&body);
-                    var body_reader = std.Io.Reader.fixed(&body);
+                    var out: [BTREE_LEAF_BLOCK_SIZE]u8 = undefined;
+                    out[0] = header.kind_int;
+                    out[1] = header.num;
+                    try reader.interface.readSliceAll(out[BTREE_NODE_HEADER_SIZE..]);
 
-                    var slots: [BTREE_SLOT_COUNT]Slot = undefined;
-                    for (&slots) |*s| {
-                        const value_slot: Slot = @bitCast(try takeInt(&body_reader, SlotInt, .big));
+                    const slot_len = comptime byteSizeOf(Slot);
+                    for (0..BTREE_SLOT_COUNT) |i| {
+                        const off = BTREE_NODE_HEADER_SIZE + i * slot_len;
+                        const value_slot: Slot = @bitCast(std.mem.readInt(SlotInt, out[off..][0..slot_len], .big));
                         try value_slot.tag.validate();
-                        s.* = try self.remapSlot(value_slot);
+                        const remapped = try self.remapSlot(value_slot);
+                        std.mem.writeInt(SlotInt, out[off..][0..slot_len], @bitCast(remapped), .big);
                     }
 
+                    var writer = self.target_core.writer();
                     try writer.seekTo(target_offset);
-                    try writer.interface.writeInt(u8, header.kind_int, .big);
-                    try writer.interface.writeInt(u8, header.num, .big);
-                    for (slots) |s| try writer.interface.writeInt(SlotInt, @bitCast(s), .big);
+                    try writer.interface.writeAll(&out);
                 }
 
                 fn populateBTreeBranch(self: *Self, source_offset: u64, target_offset: u64, header: NodeHeader) anyerror!void {
                     var reader = self.source_core.reader();
-                    var writer = self.target_core.writer();
                     try reader.seekTo(source_offset + BTREE_NODE_HEADER_SIZE);
 
-                    var body: [BTREE_BRANCH_BLOCK_SIZE - BTREE_NODE_HEADER_SIZE]u8 = @splat(0);
-                    try reader.interface.readSliceAll(&body);
-                    var body_reader = std.Io.Reader.fixed(&body);
+                    var out: [BTREE_BRANCH_BLOCK_SIZE]u8 = undefined;
+                    out[0] = header.kind_int;
+                    out[1] = header.num;
+                    try reader.interface.readSliceAll(out[BTREE_NODE_HEADER_SIZE..]);
 
-                    var children: [BTREE_SLOT_COUNT]Slot = undefined;
-                    for (&children) |*s| {
-                        const child: Slot = @bitCast(try takeInt(&body_reader, SlotInt, .big));
+                    const slot_len = comptime byteSizeOf(Slot);
+                    for (0..BTREE_SLOT_COUNT) |i| {
+                        const off = BTREE_NODE_HEADER_SIZE + i * slot_len;
+                        const child: Slot = @bitCast(std.mem.readInt(SlotInt, out[off..][0..slot_len], .big));
                         try child.tag.validate();
                         if (child.tag == .index) {
                             const remapped_ptr = try self.remapBTreeNode(child.value);
-                            s.* = .{ .value = remapped_ptr, .tag = .index, .full = child.full };
-                        } else {
-                            s.* = child;
+                            const remapped = Slot{ .value = remapped_ptr, .tag = .index, .full = child.full };
+                            std.mem.writeInt(SlotInt, out[off..][0..slot_len], @bitCast(remapped), .big);
                         }
                     }
-                    var counts: [BTREE_SLOT_COUNT]u64 = undefined;
-                    for (&counts) |*c| c.* = try takeInt(&body_reader, u64, .big);
 
+                    var writer = self.target_core.writer();
                     try writer.seekTo(target_offset);
-                    try writer.interface.writeInt(u8, header.kind_int, .big);
-                    try writer.interface.writeInt(u8, header.num, .big);
-                    for (children) |s| try writer.interface.writeInt(SlotInt, @bitCast(s), .big);
-                    for (counts) |c| try writer.interface.writeInt(u64, c, .big);
+                    try writer.interface.writeAll(&out);
                 }
 
                 fn populateHashMapOrSet(self: *Self, source_offset: u64, target_offset: u64, _: void) anyerror!void {
@@ -4828,34 +4829,28 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                 }
 
                 fn populateHashMapOrSetCounted(self: *Self, source_offset: u64, target_offset: u64, comptime counted: bool) anyerror!void {
+                    const block_start = comptime if (counted) byteSizeOf(u64) else 0;
+                    const total_size = comptime block_start + INDEX_BLOCK_SIZE;
+
                     var reader = self.source_core.reader();
-                    var writer = self.target_core.writer();
-
                     try reader.seekTo(source_offset);
+                    var buf: [total_size]u8 = undefined;
+                    try reader.interface.readSliceAll(&buf);
 
-                    const count_value: ?u64 = if (counted) try takeInt(&reader.interface, u64, .big) else null;
-
-                    // read 144-byte root index block
-                    var block_bytes: [INDEX_BLOCK_SIZE]u8 = @splat(0);
-                    try reader.interface.readSliceAll(&block_bytes);
-
-                    // remap each child slot in the block
-                    var block_reader = std.Io.Reader.fixed(&block_bytes);
-                    var remapped_slots: [SLOT_COUNT]Slot = undefined;
-                    for (&remapped_slots) |*s| {
-                        const child_slot: Slot = @bitCast(try takeInt(&block_reader, SlotInt, .big));
+                    // remap each child slot in place
+                    const slot_len = comptime byteSizeOf(Slot);
+                    for (0..SLOT_COUNT) |i| {
+                        const off = block_start + i * slot_len;
+                        const child_slot: Slot = @bitCast(std.mem.readInt(SlotInt, buf[off..][0..slot_len], .big));
                         try child_slot.tag.validate();
-                        s.* = try self.remapSlot(child_slot);
+                        const remapped = try self.remapSlot(child_slot);
+                        std.mem.writeInt(SlotInt, buf[off..][0..slot_len], @bitCast(remapped), .big);
                     }
 
                     // write [optional count][remapped block] contiguously to target
+                    var writer = self.target_core.writer();
                     try writer.seekTo(target_offset);
-                    if (count_value) |c| {
-                        try writer.interface.writeInt(u64, c, .big);
-                    }
-                    for (remapped_slots) |s| {
-                        try writer.interface.writeInt(SlotInt, @bitCast(s), .big);
-                    }
+                    try writer.interface.writeAll(&buf);
                 }
 
                 fn populateKvPair(self: *Self, source_offset: u64, target_offset: u64, tag: Tag) anyerror!void {
@@ -4909,61 +4904,59 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
 
                 fn populateSortedMapLeaf(self: *Self, source_offset: u64, target_offset: u64, header: NodeHeader) anyerror!void {
                     var reader = self.source_core.reader();
-                    var writer = self.target_core.writer();
                     try reader.seekTo(source_offset + BTREE_NODE_HEADER_SIZE);
 
-                    var body: [SORTED_LEAF_BLOCK_SIZE - BTREE_NODE_HEADER_SIZE]u8 = @splat(0);
-                    try reader.interface.readSliceAll(&body);
-                    var body_reader = std.Io.Reader.fixed(&body);
+                    var out: [SORTED_LEAF_BLOCK_SIZE]u8 = undefined;
+                    out[0] = header.kind_int;
+                    out[1] = header.num;
+                    try reader.interface.readSliceAll(out[BTREE_NODE_HEADER_SIZE..]);
 
-                    var entries: [BTREE_SLOT_COUNT]Slot = undefined;
-                    for (&entries) |*s| {
-                        const entry: Slot = @bitCast(try takeInt(&body_reader, SlotInt, .big));
+                    const slot_len = comptime byteSizeOf(Slot);
+                    for (0..BTREE_SLOT_COUNT) |i| {
+                        const off = BTREE_NODE_HEADER_SIZE + i * slot_len;
+                        const entry: Slot = @bitCast(std.mem.readInt(SlotInt, out[off..][0..slot_len], .big));
                         try entry.tag.validate();
-                        s.* = try self.remapSlot(entry);
+                        const remapped = try self.remapSlot(entry);
+                        std.mem.writeInt(SlotInt, out[off..][0..slot_len], @bitCast(remapped), .big);
                     }
 
+                    var writer = self.target_core.writer();
                     try writer.seekTo(target_offset);
-                    try writer.interface.writeInt(u8, header.kind_int, .big);
-                    try writer.interface.writeInt(u8, header.num, .big);
-                    for (entries) |s| try writer.interface.writeInt(SlotInt, @bitCast(s), .big);
+                    try writer.interface.writeAll(&out);
                 }
 
                 fn populateSortedMapBranch(self: *Self, source_offset: u64, target_offset: u64, header: NodeHeader) anyerror!void {
                     var reader = self.source_core.reader();
-                    var writer = self.target_core.writer();
                     try reader.seekTo(source_offset + BTREE_NODE_HEADER_SIZE);
 
-                    var body: [SORTED_BRANCH_BLOCK_SIZE - BTREE_NODE_HEADER_SIZE]u8 = @splat(0);
-                    try reader.interface.readSliceAll(&body);
-                    var body_reader = std.Io.Reader.fixed(&body);
+                    var out: [SORTED_BRANCH_BLOCK_SIZE]u8 = undefined;
+                    out[0] = header.kind_int;
+                    out[1] = header.num;
+                    try reader.interface.readSliceAll(out[BTREE_NODE_HEADER_SIZE..]);
 
-                    var children: [BTREE_SLOT_COUNT]Slot = undefined;
-                    for (&children) |*s| {
-                        const child: Slot = @bitCast(try takeInt(&body_reader, SlotInt, .big));
+                    const slot_len = comptime byteSizeOf(Slot);
+                    const children_bytes = BTREE_SLOT_COUNT * slot_len;
+                    for (0..BTREE_SLOT_COUNT) |i| {
+                        const off = BTREE_NODE_HEADER_SIZE + i * slot_len;
+                        const child: Slot = @bitCast(std.mem.readInt(SlotInt, out[off..][0..slot_len], .big));
                         try child.tag.validate();
                         if (child.tag == .index) {
                             const remapped_ptr = try self.remapSortedMapNode(child.value);
-                            s.* = .{ .value = remapped_ptr, .tag = .index, .full = child.full };
-                        } else {
-                            s.* = child;
+                            const remapped = Slot{ .value = remapped_ptr, .tag = .index, .full = child.full };
+                            std.mem.writeInt(SlotInt, out[off..][0..slot_len], @bitCast(remapped), .big);
                         }
                     }
-                    var separators: [BTREE_SLOT_COUNT]Slot = undefined;
-                    for (&separators) |*s| {
-                        const sep: Slot = @bitCast(try takeInt(&body_reader, SlotInt, .big));
+                    for (0..BTREE_SLOT_COUNT) |i| {
+                        const off = BTREE_NODE_HEADER_SIZE + children_bytes + i * slot_len;
+                        const sep: Slot = @bitCast(std.mem.readInt(SlotInt, out[off..][0..slot_len], .big));
                         try sep.tag.validate();
-                        s.* = try self.remapSlot(sep);
+                        const remapped = try self.remapSlot(sep);
+                        std.mem.writeInt(SlotInt, out[off..][0..slot_len], @bitCast(remapped), .big);
                     }
-                    var counts: [BTREE_SLOT_COUNT]u64 = undefined;
-                    for (&counts) |*c| c.* = try takeInt(&body_reader, u64, .big);
 
+                    var writer = self.target_core.writer();
                     try writer.seekTo(target_offset);
-                    try writer.interface.writeInt(u8, header.kind_int, .big);
-                    try writer.interface.writeInt(u8, header.num, .big);
-                    for (children) |s| try writer.interface.writeInt(SlotInt, @bitCast(s), .big);
-                    for (separators) |s| try writer.interface.writeInt(SlotInt, @bitCast(s), .big);
-                    for (counts) |c| try writer.interface.writeInt(u64, c, .big);
+                    try writer.interface.writeAll(&out);
                 }
             };
         }
