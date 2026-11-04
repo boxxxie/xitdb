@@ -4364,3 +4364,61 @@ fn testRoots(
         try std.testing.expectEqual(size, try db.committedSize());
     }
 }
+
+test "buffered file alternating handles preserve all commits" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+
+    const file_a = try std.Io.Dir.cwd().createFile(io, "alternating.db", .{ .read = true, .truncate = true });
+    defer {
+        file_a.close(io);
+        std.Io.Dir.cwd().deleteFile(io, "alternating.db") catch {};
+    }
+    const file_b = try std.Io.Dir.cwd().openFile(io, "alternating.db", .{ .mode = .read_write });
+    defer file_b.close(io);
+
+    var buf_a = std.Io.Writer.Allocating.init(allocator);
+    defer buf_a.deinit();
+    var buf_b = std.Io.Writer.Allocating.init(allocator);
+    defer buf_b.deinit();
+
+    const DB = xitdb.Database(.buffered_file, HashInt);
+    var db_a = try DB.init(io, .{ .file = file_a, .buffer = &buf_a });
+    var db_b = try DB.init(io, .{ .file = file_b, .buffer = &buf_b });
+
+    // Commit 1 via Handle A
+    {
+        const hist_a = try DB.ArrayList(.read_write).init(db_a.rootCursor());
+        try hist_a.append(.{ .uint = 1 });
+    }
+    // Commit 2 via Handle B (must also be readable from Handle A afterward)
+    {
+        const hist_b = try DB.ArrayList(.read_write).init(db_b.rootCursor());
+        try hist_b.append(.{ .uint = 2 });
+    }
+    // Commit 3 via Handle A (must append after Handle B's commit, not clobber it)
+    {
+        const hist_a = try DB.ArrayList(.read_write).init(db_a.rootCursor());
+        try hist_a.append(.{ .uint = 3 });
+    }
+
+    // Both existing handles and a fresh open must see 1, 2, 3
+    {
+        const hist_b = try DB.ArrayList(.read_only).init(db_b.rootCursor().readOnly());
+        try std.testing.expectEqual(3, try hist_b.count());
+        try std.testing.expectEqual(1, try (try hist_b.getCursor(0)).?.readUint());
+        try std.testing.expectEqual(2, try (try hist_b.getCursor(1)).?.readUint());
+        try std.testing.expectEqual(3, try (try hist_b.getCursor(2)).?.readUint());
+    }
+
+    const file_c = try std.Io.Dir.cwd().openFile(io, "alternating.db", .{ .mode = .read_only });
+    defer file_c.close(io);
+    var buf_c = std.Io.Writer.Allocating.init(allocator);
+    defer buf_c.deinit();
+    var db_c = try DB.init(io, .{ .file = file_c, .buffer = &buf_c });
+    const hist_c = try DB.ArrayList(.read_only).init(db_c.rootCursor().readOnly());
+    try std.testing.expectEqual(3, try hist_c.count());
+    try std.testing.expectEqual(1, try (try hist_c.getCursor(0)).?.readUint());
+    try std.testing.expectEqual(2, try (try hist_c.getCursor(1)).?.readUint());
+    try std.testing.expectEqual(3, try (try hist_c.getCursor(2)).?.readUint());
+}
