@@ -3760,12 +3760,13 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     fn readSlotBlock(cursor: Cursor(write_mode), position: u64) ![SLOT_COUNT]Slot {
                         var core_reader = cursor.db.core.reader();
                         try core_reader.seekTo(position);
-                        var index_block_bytes: [INDEX_BLOCK_SIZE]u8 = @splat(0);
+                        var index_block_bytes: [INDEX_BLOCK_SIZE]u8 = undefined;
                         try core_reader.interface.readSliceAll(&index_block_bytes);
                         var index_block: [SLOT_COUNT]Slot = undefined;
-                        var block_reader = std.Io.Reader.fixed(&index_block_bytes);
-                        for (&index_block) |*block_slot| {
-                            block_slot.* = @bitCast(try takeInt(&block_reader, SlotInt, .big));
+                        const slot_len = comptime byteSizeOf(Slot);
+                        for (&index_block, 0..) |*block_slot, i| {
+                            const off = i * slot_len;
+                            block_slot.* = @bitCast(std.mem.readInt(SlotInt, index_block_bytes[off..][0..slot_len], .big));
                             try block_slot.tag.validate();
                         }
                         return index_block;
