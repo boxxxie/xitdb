@@ -186,6 +186,92 @@ test "validate tag" {
     try std.testing.expectEqual(error.InvalidEnumTag, invalid.tag.validate());
 }
 
+test "cursor reader held across buffer reallocation" {
+    const allocator = std.testing.allocator;
+    var buffer = try std.Io.Writer.Allocating.initCapacity(allocator, 64);
+    defer buffer.deinit();
+
+    const DB = xitdb.Database(.memory, HashInt);
+    var db = try DB.init(std.testing.io, .{ .buffer = &buffer });
+    const history = try DB.ArrayList(.read_write).init(db.rootCursor());
+
+    const payload = "0123456789abcdef0123456789abcdef";
+    const short_payload = "short77";
+    try history.append(.{ .bytes = payload });
+    try history.append(.{ .bytes = short_payload });
+
+    var item_cursor = (try history.getCursor(0)).?;
+    var read_buf: [8]u8 = undefined;
+    var reader = try item_cursor.reader(&read_buf);
+
+    var short_cursor = (try history.getCursor(1)).?;
+    var short_buf: [4]u8 = undefined;
+    var short_reader = try short_cursor.reader(&short_buf);
+
+    // Read initial chunks before growing the buffer
+    var first_part: [8]u8 = undefined;
+    try reader.interface.readSliceAll(&first_part);
+    try std.testing.expectEqualStrings(payload[0..8], &first_part);
+
+    var short_first: [3]u8 = undefined;
+    try short_reader.interface.readSliceAll(&short_first);
+    try std.testing.expectEqualStrings(short_payload[0..3], &short_first);
+
+    // Force multiple buffer reallocations while both readers are held open
+    const big_chunk: [4096]u8 = @splat('X');
+    for (0..32) |_| {
+        try history.append(.{ .bytes = &big_chunk });
+    }
+
+    // Read remaining bytes from the held readers and seek back to 0
+    var rest_part: [24]u8 = undefined;
+    try reader.interface.readSliceAll(&rest_part);
+    try std.testing.expectEqualStrings(payload[8..32], &rest_part);
+
+    var short_rest: [4]u8 = undefined;
+    try short_reader.interface.readSliceAll(&short_rest);
+    try std.testing.expectEqualStrings(short_payload[3..7], &short_rest);
+
+    try reader.seekTo(0);
+    var full_out: [32]u8 = undefined;
+    try reader.interface.readSliceAll(&full_out);
+    try std.testing.expectEqualStrings(payload, &full_out);
+}
+
+test "cursor reader seekTo after read bypassing buffer" {
+    const allocator = std.testing.allocator;
+    var buffer = std.Io.Writer.Allocating.init(allocator);
+    defer buffer.deinit();
+
+    const DB = xitdb.Database(.memory, HashInt);
+    var db = try DB.init(std.testing.io, .{ .buffer = &buffer });
+    const history = try DB.ArrayList(.read_write).init(db.rootCursor());
+
+    const payload = "0123456789abcdefGHIJKLMNOPQRSTUV";
+    try history.append(.{ .bytes = payload });
+
+    var item_cursor = (try history.getCursor(0)).?;
+    var read_buf: [16]u8 = undefined;
+    var reader = try item_cursor.reader(&read_buf);
+
+    // Fill 16-byte buffer [0..16), consume [0..4)
+    var head: [4]u8 = undefined;
+    try reader.interface.readSliceAll(&head);
+    try std.testing.expectEqualStrings(payload[0..4], &head);
+
+    // Read 20 bytes [4..24): drains [4..16) from read_buf and streams [16..24) directly,
+    // leaving read_buf containing [0..16) while reader.pos advances to 24.
+    var mid: [20]u8 = undefined;
+    try reader.interface.readSliceAll(&mid);
+    try std.testing.expectEqualStrings(payload[4..24], &mid);
+
+    // Seeking backward to 10 must read payload[10..], not stale read_buf[2..]
+    try reader.seekTo(10);
+    var tail: [22]u8 = undefined;
+    try reader.interface.readSliceAll(&tail);
+    try std.testing.expectEqualStrings(payload[10..32], &tail);
+}
+
 fn hashInt(buffer: []const u8) HashInt {
     var hash: [@bitSizeOf(HashInt) / 8]u8 = undefined;
     std.crypto.hash.Sha1.hash(buffer, &hash, .{});

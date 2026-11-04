@@ -3009,6 +3009,19 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
 
                         if (r.pos >= r.size) return error.EndOfStream;
 
+                        if (comptime db_kind == .memory) {
+                            const written = r.parent.db.core.buffer.written();
+                            const abs_pos = std.math.add(u64, r.start_position, r.pos) catch return error.EndOfStream;
+                            if (abs_pos >= written.len) return error.EndOfStream;
+                            const start: usize = @intCast(abs_pos);
+                            const max_avail = @min(r.size - r.pos, written.len - start);
+                            const n: usize = @intCast(@min(@backingInt(limit), max_avail));
+                            if (n == 0) return 0;
+                            const size = try io_w.write(written[start .. start + n]);
+                            r.pos += size;
+                            return size;
+                        }
+
                         const new_limit: std.Io.Limit = .limited64(@min(@backingInt(limit), r.size - r.pos));
                         const dest = new_limit.slice(try io_w.writableSliceGreedy(1));
 
