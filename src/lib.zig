@@ -1701,20 +1701,56 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                         switch (write_mode) {
                             .read_only => return error.KeyNotFound,
                             .read_write => {
-                                // append new index block
-                                if (key_offset + 1 >= (HASH_SIZE * 8) / BIT_COUNT) {
+                                // find the first nibble where the two hashes diverge before writing
+                                const max_offset: usize = (HASH_SIZE * 8) / BIT_COUNT;
+                                var diff_offset: usize = @as(usize, key_offset) + 1;
+                                while (diff_offset < max_offset) : (diff_offset += 1) {
+                                    const shift: std.math.Log2Int(HashInt) = @intCast(diff_offset * BIT_COUNT);
+                                    const existing_i: u4 = @intCast((kv_pair.hash >> shift) & MASK);
+                                    const new_i: u4 = @intCast((key_hash >> shift) & MASK);
+                                    if (existing_i != new_i) break;
+                                }
+                                if (diff_offset >= max_offset or diff_offset > std.math.maxInt(u8)) {
                                     return error.KeyOffsetExceeded;
                                 }
-                                const next_i: u4 = @intCast((kv_pair.hash >> @intCast((key_offset + 1) * BIT_COUNT)) & MASK);
-                                const next_index_pos = try self.core.length();
-                                var index_block: [INDEX_BLOCK_SIZE]u8 = @splat(0);
-                                try writer.seekTo(next_index_pos);
-                                try writer.interface.writeAll(&index_block);
-                                try writer.seekTo(next_index_pos + (byteSizeOf(Slot) * next_i));
-                                try writer.interface.writeInt(SlotInt, @bitCast(slot), .big);
-                                const res = try self.readMapSlot(next_index_pos, key_hash, key_offset + 1, write_mode, target, frozen_at);
+
+                                // append any shared-nibble index blocks and the diverging leaf block,
+                                // only updating slot_pos after the child kv_pair write succeeds
+                                const slot_len = comptime byteSizeOf(Slot);
+                                const first_index_pos = try self.core.length();
+                                try writer.seekTo(first_index_pos);
+                                var cur_index_pos = first_index_pos;
+
+                                var off: usize = @as(usize, key_offset) + 1;
+                                while (off < diff_offset) : (off += 1) {
+                                    const shift: std.math.Log2Int(HashInt) = @intCast(off * BIT_COUNT);
+                                    const nib: u4 = @intCast((key_hash >> shift) & MASK);
+                                    const child_index_pos = cur_index_pos + INDEX_BLOCK_SIZE;
+                                    var mid_block: [INDEX_BLOCK_SIZE]u8 = @splat(0);
+                                    std.mem.writeInt(
+                                        SlotInt,
+                                        mid_block[@as(usize, nib) * slot_len ..][0..slot_len],
+                                        @bitCast(Slot{ .value = child_index_pos, .tag = .index }),
+                                        .big,
+                                    );
+                                    try writer.interface.writeAll(&mid_block);
+                                    cur_index_pos = child_index_pos;
+                                }
+
+                                const leaf_shift: std.math.Log2Int(HashInt) = @intCast(diff_offset * BIT_COUNT);
+                                const existing_i: u4 = @intCast((kv_pair.hash >> leaf_shift) & MASK);
+                                var leaf_block: [INDEX_BLOCK_SIZE]u8 = @splat(0);
+                                std.mem.writeInt(
+                                    SlotInt,
+                                    leaf_block[@as(usize, existing_i) * slot_len ..][0..slot_len],
+                                    @bitCast(slot),
+                                    .big,
+                                );
+                                try writer.interface.writeAll(&leaf_block);
+
+                                const res = try self.readMapSlot(cur_index_pos, key_hash, @intCast(diff_offset), write_mode, target, frozen_at);
                                 try writer.seekTo(slot_pos);
-                                try writer.interface.writeInt(SlotInt, @bitCast(Slot{ .value = next_index_pos, .tag = .index }), .big);
+                                try writer.interface.writeInt(SlotInt, @bitCast(Slot{ .value = first_index_pos, .tag = .index }), .big);
                                 return res;
                             },
                         }
@@ -1732,21 +1768,12 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
             var reader = self.core.reader();
             var writer = self.core.writer();
 
-            // read block
-            var slot_block: [SLOT_COUNT]Slot = @splat(.{});
-            try reader.seekTo(index_pos);
-            var index_block: [INDEX_BLOCK_SIZE]u8 = @splat(0);
-            try reader.interface.readSliceAll(&index_block);
-            var block_reader = std.Io.Reader.fixed(&index_block);
-            for (&slot_block) |*block_slot| {
-                block_slot.* = @bitCast(try takeInt(&block_reader, SlotInt, .big));
-                try block_slot.tag.validate();
-            }
-
-            // get the current slot
+            // read only the target slot on the way down
             const i: u4 = @intCast((key_hash >> @intCast(key_offset * BIT_COUNT)) & MASK);
             const slot_pos = index_pos + (byteSizeOf(Slot) * i);
-            const slot = slot_block[i];
+            try reader.seekTo(slot_pos);
+            const slot: Slot = @bitCast(try takeInt(&reader.interface, SlotInt, .big));
+            try slot.tag.validate();
 
             // get the slot that will replace the current slot
             const next_slot: Slot = switch (slot.tag) {
@@ -1764,17 +1791,34 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                 else => return error.UnexpectedTag,
             };
 
-            // if we're the root node, just write the new slot and finish
-            if (key_offset == 0) {
-                try writer.seekTo(slot_pos);
+            // if we're the root node, or the child is still a branch (.index),
+            // this index block cannot collapse into a single .kv_pair or .none
+            if (key_offset == 0 or next_slot.tag == .index) {
+                const next_index_pos = if (key_offset == 0) index_pos else try self.copyIndexBlockIfOld(index_pos, frozen_at);
+                try writer.seekTo(next_index_pos + (byteSizeOf(Slot) * i));
                 try writer.interface.writeInt(SlotInt, @bitCast(next_slot), .big);
-                return .{ .value = index_pos, .tag = .index };
+                return .{ .value = next_index_pos, .tag = .index };
+            }
+
+            // read sibling slots to check if this index block can collapse
+            var slot_block: [SLOT_COUNT]Slot = undefined;
+            try reader.seekTo(index_pos);
+            var index_block: [INDEX_BLOCK_SIZE]u8 = undefined;
+            try reader.interface.readSliceAll(&index_block);
+            const slot_len = comptime byteSizeOf(Slot);
+            for (&slot_block, 0..) |*block_slot, j| {
+                if (j == i) {
+                    block_slot.* = next_slot;
+                } else {
+                    const off = j * slot_len;
+                    block_slot.* = @bitCast(std.mem.readInt(SlotInt, index_block[off..][0..slot_len], .big));
+                    try block_slot.tag.validate();
+                }
             }
 
             // get slot to return if there is only one used slot
             // in this index block
             var slot_to_return_maybe: ?Slot = .{ .tag = .none };
-            slot_block[i] = next_slot;
             for (slot_block) |block_slot| {
                 if (block_slot.tag == .none) continue;
 
