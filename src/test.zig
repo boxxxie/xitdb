@@ -4586,3 +4586,65 @@ test "buffered file clears cached file length when first write fails" {
     try std.testing.expectEqual(1, try (try hist_a.getCursor(0)).?.readUint());
     try std.testing.expectEqual(2, try (try hist_a.getCursor(1)).?.readUint());
 }
+
+test "validate b-tree leaf bounds when descending by rank" {
+    const allocator = std.testing.allocator;
+    var buffer = std.Io.Writer.Allocating.init(allocator);
+    defer buffer.deinit();
+
+    const DB = xitdb.Database(.memory, HashInt);
+    var db = try DB.init(std.testing.io, .{ .buffer = &buffer, .max_size = 500_000 });
+
+    const Ctx = struct {
+        pub fn run(_: @This(), cursor: *DB.Cursor(.read_write)) !void {
+            const root_map = try DB.HashMap(.read_write).init(cursor.*);
+            const ll = try DB.LinkedArrayList(.read_write).init(try root_map.putCursor(hashInt("ll")));
+            for (0..20) |i| try ll.append(.{ .uint = i });
+            const sm = try DB.SortedMap(.read_write).init(try root_map.putCursor(hashInt("sm")));
+            for (0..20) |i| {
+                var kbuf: [8]u8 = undefined;
+                const key = try std.fmt.bufPrint(&kbuf, "k{d:0>4}", .{i});
+                try sm.put(key, .{ .uint = i });
+            }
+        }
+    };
+    try db.runContext(Ctx{});
+
+    const root_ro = try DB.HashMap(.read_only).init(db.rootCursor().readOnly());
+    const ll_cursor = (try root_ro.getCursor(hashInt("ll"))).?;
+    const sm_cursor = (try root_ro.getCursor(hashInt("sm"))).?;
+
+    // inflate counts[0] in both root branches (from 8 to 15) while child[0] leaf still has num = 8
+    const ll_root_ptr = std.mem.readInt(u64, buffer.written()[@intCast(ll_cursor.slot_ptr.slot.value + 8)..][0..8], .big);
+    std.mem.writeInt(u64, buffer.written()[@intCast(ll_root_ptr + 2 + 16 * 9)..][0..8], 15, .big);
+
+    const sm_root_ptr = std.mem.readInt(u64, buffer.written()[@intCast(sm_cursor.slot_ptr.slot.value + 8)..][0..8], .big);
+    std.mem.writeInt(u64, buffer.written()[@intCast(sm_root_ptr + 2 + 32 * 9)..][0..8], 15, .big);
+
+    const ll_ro = try DB.LinkedArrayList(.read_only).init(ll_cursor);
+    try std.testing.expectError(error.InvalidBTreeNode, ll_ro.getCursor(10));
+    try std.testing.expectError(error.InvalidBTreeNode, ll_ro.iteratorFrom(10));
+
+    const sm_ro = try DB.SortedMap(.read_only).init(sm_cursor);
+    try std.testing.expectError(error.InvalidBTreeNode, sm_ro.getIndexKeyValuePair(10));
+    try std.testing.expectError(error.InvalidBTreeNode, sm_ro.iteratorFromIndex(10));
+
+    const MutateCtx = struct {
+        op: enum { put, insert, remove, slice },
+
+        pub fn run(self: @This(), cursor: *DB.Cursor(.read_write)) !void {
+            const root_map = try DB.HashMap(.read_write).init(cursor.*);
+            const ll = try DB.LinkedArrayList(.read_write).init(try root_map.putCursor(hashInt("ll")));
+            switch (self.op) {
+                .put => try ll.put(10, .{ .uint = 99 }),
+                .insert => try ll.insert(10, .{ .uint = 99 }),
+                .remove => try ll.remove(10),
+                .slice => try ll.slice(10, 5),
+            }
+        }
+    };
+    try std.testing.expectError(error.InvalidBTreeNode, db.runContext(MutateCtx{ .op = .put }));
+    try std.testing.expectError(error.InvalidBTreeNode, db.runContext(MutateCtx{ .op = .insert }));
+    try std.testing.expectError(error.InvalidBTreeNode, db.runContext(MutateCtx{ .op = .remove }));
+    try std.testing.expectError(error.InvalidBTreeNode, db.runContext(MutateCtx{ .op = .slice }));
+}
