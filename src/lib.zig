@@ -5207,15 +5207,13 @@ const CoreBufferedFile = struct {
                     parent.memory_pos = w.pos;
                 }
 
-                if (parent.file_len == null) {
-                    parent.file_len = parent.file.length() catch return error.WriteFailed;
-                }
-
                 // write to the in-memory buffer
                 if (w.pos >= parent.memory_pos and w.pos - parent.memory_pos + n <= parent.memory_max_size) {
+                    const file_len = parent.file_len orelse (parent.file.length() catch return error.WriteFailed);
                     var memory_writer = parent.memory.writer();
                     memory_writer.seekTo(w.pos - parent.memory_pos) catch return error.WriteFailed;
                     memory_writer.interface.writeAll(buf) catch return error.WriteFailed;
+                    parent.file_len = file_len;
                 }
                 // write to the disk
                 else {
@@ -5223,6 +5221,9 @@ const CoreBufferedFile = struct {
                     // clobbered by a later flush of stale buffer bytes, so flush first
                     if (w.pos < parent.memory_pos + parent.memory.buffer.written().len and w.pos + n > parent.memory_pos) {
                         parent.flush() catch return error.WriteFailed;
+                    }
+                    if (parent.file_len == null) {
+                        parent.file_len = parent.file.length() catch return error.WriteFailed;
                     }
                     parent.writeToFile(w.pos, buf) catch return error.WriteFailed;
                 }
