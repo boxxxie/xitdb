@@ -4364,3 +4364,44 @@ fn testRoots(
         try std.testing.expectEqual(size, try db.committedSize());
     }
 }
+
+test "buffered file clears cached file length when first write fails" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    const DB = xitdb.Database(.buffered_file, HashInt);
+
+    const file_a = try std.Io.Dir.cwd().createFile(io, "shared_buf.db", .{ .read = true, .truncate = true });
+    defer {
+        file_a.close(io);
+        std.Io.Dir.cwd().deleteFile(io, "shared_buf.db") catch {};
+    }
+    const file_b = try std.Io.Dir.cwd().openFile(io, "shared_buf.db", .{ .mode = .read_write });
+    defer file_b.close(io);
+
+    var failing = std.testing.FailingAllocator.init(allocator, .{});
+    var buf_a = std.Io.Writer.Allocating.init(failing.allocator());
+    defer buf_a.deinit();
+    var buf_b = std.Io.Writer.Allocating.init(allocator);
+    defer buf_b.deinit();
+
+    var db_a = try DB.init(io, .{ .file = file_a, .buffer = &buf_a });
+    var db_b = try DB.init(io, .{ .file = file_b, .buffer = &buf_b });
+
+    const hist_a = try DB.ArrayList(.read_write).init(db_a.rootCursor());
+    try hist_a.append(.{ .uint = 1 });
+
+    // fail the first buffered write of the next transaction so the buffer stays empty
+    buf_a.deinit();
+    failing.fail_index = failing.alloc_index;
+    buf_a = std.Io.Writer.Allocating.init(failing.allocator());
+    try std.testing.expectError(error.WriteFailed, hist_a.append(.{ .uint = 999 }));
+    failing.fail_index = std.math.maxInt(usize);
+
+    // another writer extends the file; db_a must not keep a stale file_len
+    const hist_b = try DB.ArrayList(.read_write).init(db_b.rootCursor());
+    try hist_b.append(.{ .uint = 2 });
+
+    try std.testing.expectEqual(2, try hist_a.count());
+    try std.testing.expectEqual(1, try (try hist_a.getCursor(0)).?.readUint());
+    try std.testing.expectEqual(2, try (try hist_a.getCursor(1)).?.readUint());
+}
