@@ -875,6 +875,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
             var writer = self.core.writer();
             try writer.seekTo(fileSizeStart(self.header.version));
             try writer.interface.writeInt(u64, file_size, .big);
+            try self.core.flush();
         }
 
         // whether this slot pointer is the root of the database
