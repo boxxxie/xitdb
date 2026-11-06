@@ -4648,3 +4648,145 @@ test "validate b-tree leaf bounds when descending by rank" {
     try std.testing.expectError(error.InvalidBTreeNode, db.runContext(MutateCtx{ .op = .remove }));
     try std.testing.expectError(error.InvalidBTreeNode, db.runContext(MutateCtx{ .op = .slice }));
 }
+
+fn testConcurrentSnapshots(
+    comptime db_kind: xitdb.DatabaseKind,
+    opts: xitdb.InitOpts(db_kind),
+) !void {
+    const DB = xitdb.Database(db_kind, HashInt);
+    var db = try DB.init(std.testing.io, opts);
+
+    const history = try DB.ArrayList(.read_write).init(db.rootCursor());
+    const num_moments = 4;
+    const items_per_moment = 64;
+
+    for (0..num_moments) |m| {
+        const AppendCtx = struct {
+            moment_idx: usize,
+            pub fn run(self: @This(), cursor: *DB.Cursor(.read_write)) !void {
+                const map = try DB.CountedHashMap(.read_write).init(cursor.*);
+                const sm = try DB.SortedMap(.read_write).init(try map.putCursor(hashInt("sorted")));
+                const ll = try DB.LinkedArrayList(.read_write).init(try map.putCursor(hashInt("linked")));
+                const al = try DB.ArrayList(.read_write).init(try map.putCursor(hashInt("array")));
+                for (0..items_per_moment) |i| {
+                    var kbuf: [16]u8 = undefined;
+                    const key = try std.fmt.bufPrint(&kbuf, "k-{d:0>2}-{d:0>4}", .{ self.moment_idx, i });
+                    const val: u64 = @intCast((self.moment_idx + 1) * 1000 + i);
+                    try map.putKey(hashInt(key), .{ .bytes = key });
+                    try map.put(hashInt(key), .{ .uint = val });
+                    try sm.put(key, .{ .uint = val });
+                    try ll.append(.{ .uint = val });
+                    try al.append(.{ .uint = val });
+                }
+            }
+        };
+        try history.appendContext(.{ .slot = try history.getSlot(-1) }, AppendCtx{ .moment_idx = m });
+    }
+
+    const hist_ro = try DB.ArrayList(.read_only).init(db.rootCursor().readOnly());
+    var moments: [num_moments]DB.Cursor(.read_only) = undefined;
+    for (0..num_moments) |m| {
+        moments[m] = (try hist_ro.getCursor(@intCast(m))).?;
+    }
+
+    const Worker = struct {
+        fn run(moment_cursor: DB.Cursor(.read_only), moment_idx: usize, failed: *std.atomic.Value(bool)) void {
+            verify(moment_cursor, moment_idx) catch {
+                failed.store(true, .release);
+            };
+        }
+
+        fn verify(moment_cursor: DB.Cursor(.read_only), moment_idx: usize) !void {
+            for (0..8) |_| {
+                const map = try DB.CountedHashMap(.read_only).init(moment_cursor);
+                const sm = try DB.SortedMap(.read_only).init((try map.getCursor(hashInt("sorted"))).?);
+                const ll = try DB.LinkedArrayList(.read_only).init((try map.getCursor(hashInt("linked"))).?);
+                const al = try DB.ArrayList(.read_only).init((try map.getCursor(hashInt("array"))).?);
+
+                const expected_total = (moment_idx + 1) * items_per_moment;
+                try std.testing.expectEqual(expected_total, try sm.count());
+                try std.testing.expectEqual(expected_total, try ll.count());
+                try std.testing.expectEqual(expected_total, try al.count());
+
+                for (0..items_per_moment) |i| {
+                    var kbuf: [16]u8 = undefined;
+                    const key = try std.fmt.bufPrint(&kbuf, "k-{d:0>2}-{d:0>4}", .{ moment_idx, i });
+                    const expected: u64 = @intCast((moment_idx + 1) * 1000 + i);
+                    const list_idx: i65 = @intCast(moment_idx * items_per_moment + i);
+
+                    try std.testing.expectEqual(expected, try (try map.getCursor(hashInt(key))).?.readUint());
+                    try std.testing.expectEqual(expected, try (try sm.getCursor(key)).?.readUint());
+                    try std.testing.expectEqual(expected, try (try ll.getCursor(list_idx)).?.readUint());
+                    try std.testing.expectEqual(expected, try (try al.getCursor(list_idx)).?.readUint());
+                }
+
+                // Pause and resume an ordered B+Tree iterator from key token
+                var resume_buf: [16]u8 = undefined;
+                var resume_len: usize = 0;
+                {
+                    var it = try sm.iterator();
+                    var count: usize = 0;
+                    while (try it.next()) |entry_cur| {
+                        const kv = try entry_cur.readKeyValuePair();
+                        var k_out: [16]u8 = undefined;
+                        const k_slice = try kv.key_cursor.readBytes(&k_out);
+                        count += 1;
+                        if (count == expected_total / 2) {
+                            @memcpy(resume_buf[0..k_slice.len], k_slice);
+                            resume_len = k_slice.len;
+                            break;
+                        }
+                    }
+                }
+                {
+                    var it2 = try sm.iteratorFrom(resume_buf[0..resume_len]);
+                    var remaining: usize = 0;
+                    while (try it2.next()) |_| {
+                        remaining += 1;
+                    }
+                    try std.testing.expectEqual(expected_total - (expected_total / 2) + 1, remaining);
+                }
+            }
+        }
+    };
+
+    var failed = std.atomic.Value(bool).init(false);
+    var threads: [8]std.Thread = undefined;
+    for (0..threads.len) |t| {
+        const m = t % num_moments;
+        threads[t] = try std.Thread.spawn(.{}, Worker.run, .{ moments[m], m, &failed });
+    }
+    for (threads) |th| th.join();
+    try std.testing.expect(!failed.load(.acquire));
+}
+
+test "concurrent multi-threaded readers across memory, file, and buffered_file" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+
+    {
+        var buffer = std.Io.Writer.Allocating.init(allocator);
+        defer buffer.deinit();
+        try testConcurrentSnapshots(.memory, .{ .buffer = &buffer });
+    }
+
+    {
+        const file = try std.Io.Dir.cwd().createFile(io, "concurrent_file.db", .{ .read = true, .truncate = true });
+        defer {
+            file.close(io);
+            std.Io.Dir.cwd().deleteFile(io, "concurrent_file.db") catch {};
+        }
+        try testConcurrentSnapshots(.file, .{ .file = file, .fsync = false });
+    }
+
+    {
+        var buffer = std.Io.Writer.Allocating.init(allocator);
+        defer buffer.deinit();
+        const file = try std.Io.Dir.cwd().createFile(io, "concurrent_buf.db", .{ .read = true, .truncate = true });
+        defer {
+            file.close(io);
+            std.Io.Dir.cwd().deleteFile(io, "concurrent_buf.db") catch {};
+        }
+        try testConcurrentSnapshots(.buffered_file, .{ .file = file, .buffer = &buffer, .fsync = false });
+    }
+}

@@ -798,6 +798,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                 .file_size = try self.core.length(),
                 .root = root,
             }), .big);
+            try self.core.flush();
         }
 
         // whether this slot pointer is the root of the database
