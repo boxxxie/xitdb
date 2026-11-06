@@ -529,6 +529,8 @@ The iteration of the `HashMap` looks the same with `HashSet`, `CountedHashMap`, 
 
 `ArrayList` and `LinkedArrayList` also have an `iteratorFrom` method, which starts the iterator from the given index. `SortedMap` and `SortedSet` have `iteratorFrom` and `iteratorFromIndex` to start the iterator from a key or index respectively. This is especially useful for pagination: you can seek straight to the start of a page and walk forward only as far as you need. See the [Sorting and Paginating](#sorting-and-paginating) section for an example.
 
+All data structures also support reverse iteration via `iteratorReverse` and stepping backward with `prev()`. `ArrayList` and `LinkedArrayList` provide `iteratorReverseFrom(index)`, while `SortedMap` and `SortedSet` provide `iteratorReverseFrom(upper_key, inclusive)` and `iteratorReverseFromIndex(start_index)` for $O(\log n)$ upper-bound and descending pagination queries.
+
 ## Hashing
 
 Hashing is never done by xitdb itself. The `hashInt` function you see in the above examples is not part of the library. You can define it yourself like this:

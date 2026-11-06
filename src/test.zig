@@ -3494,6 +3494,69 @@ fn testSortedMap(allocator: std.mem.Allocator, comptime db_kind: xitdb.DatabaseK
                 try std.testing.expect((try it_lo.next()) == null);
             }
 
+            // reverse iteration over the entire sorted map yields COUNT-1 .. 0 in descending order
+            {
+                var iter = try map.iteratorReverse();
+                var expect_i: usize = COUNT;
+                while (try iter.prev()) |c| {
+                    expect_i -= 1;
+                    const kv = try c.readKeyValuePair();
+                    var kbuf: [8]u8 = undefined;
+                    var ebuf: [8]u8 = undefined;
+                    try std.testing.expectEqualStrings(try std.mem.print(&ebuf, "k{d:0>4}", .{expect_i}), try kv.key_cursor.readBytes(&kbuf));
+                }
+                try std.testing.expectEqual(0, expect_i);
+            }
+
+            // upper-bound reverse iteration from a present and an absent key (inclusive and exclusive)
+            {
+                var iter_incl = try map.iteratorReverseFrom("k0030", true);
+                var kbuf: [8]u8 = undefined;
+                try std.testing.expectEqualStrings("k0030", try (try (try iter_incl.prev()).?.readKeyValuePair()).key_cursor.readBytes(&kbuf));
+                try std.testing.expectEqualStrings("k0029", try (try (try iter_incl.prev()).?.readKeyValuePair()).key_cursor.readBytes(&kbuf));
+
+                var iter_excl = try map.iteratorReverseFrom("k0030", false);
+                try std.testing.expectEqualStrings("k0029", try (try (try iter_excl.prev()).?.readKeyValuePair()).key_cursor.readBytes(&kbuf));
+            }
+            {
+                // "k00095" sorts between "k0009" and "k0010"
+                var iter_incl = try map.iteratorReverseFrom("k00095", true);
+                var kbuf: [8]u8 = undefined;
+                try std.testing.expectEqualStrings("k0009", try (try (try iter_incl.prev()).?.readKeyValuePair()).key_cursor.readBytes(&kbuf));
+
+                var iter_excl = try map.iteratorReverseFrom("k00095", false);
+                try std.testing.expectEqualStrings("k0009", try (try (try iter_excl.prev()).?.readKeyValuePair()).key_cursor.readBytes(&kbuf));
+            }
+            {
+                // exclusive upper bound at the minimum key yields nothing; inclusive yields only k0000
+                var iter_min_excl = try map.iteratorReverseFrom("k0000", false);
+                try std.testing.expect((try iter_min_excl.prev()) == null);
+                var iter_min_incl = try map.iteratorReverseFrom("k0000", true);
+                var kbuf: [8]u8 = undefined;
+                try std.testing.expectEqualStrings("k0000", try (try (try iter_min_incl.prev()).?.readKeyValuePair()).key_cursor.readBytes(&kbuf));
+                try std.testing.expect((try iter_min_incl.prev()) == null);
+            }
+            {
+                var iter = try map.iteratorReverseFromIndex(2);
+                var kbuf: [8]u8 = undefined;
+                try std.testing.expectEqualStrings("k0002", try (try (try iter.prev()).?.readKeyValuePair()).key_cursor.readBytes(&kbuf));
+                try std.testing.expectEqualStrings("k0001", try (try (try iter.prev()).?.readKeyValuePair()).key_cursor.readBytes(&kbuf));
+                try std.testing.expectEqualStrings("k0000", try (try (try iter.prev()).?.readKeyValuePair()).key_cursor.readBytes(&kbuf));
+                try std.testing.expect((try iter.prev()) == null);
+            }
+            {
+                var iter = try map.iteratorReverseFromIndex(-@as(i65, COUNT));
+                var kbuf: [8]u8 = undefined;
+                try std.testing.expectEqualStrings("k0000", try (try (try iter.prev()).?.readKeyValuePair()).key_cursor.readBytes(&kbuf));
+                try std.testing.expect((try iter.prev()) == null);
+            }
+            {
+                var it_hi = try map.iteratorReverseFromIndex(COUNT);
+                try std.testing.expect((try it_hi.prev()) == null);
+                var it_lo = try map.iteratorReverseFromIndex(-@as(i65, COUNT) - 1);
+                try std.testing.expect((try it_lo.prev()) == null);
+            }
+
             // remove the even keys, then re-verify order, count, and presence
             {
                 var j: usize = 0;
@@ -3516,6 +3579,35 @@ fn testSortedMap(allocator: std.mem.Allocator, comptime db_kind: xitdb.DatabaseK
                     seen += 1;
                 }
                 try std.testing.expectEqual(COUNT / 2, seen);
+
+                // after deleting even keys (which includes 0-th leaf keys where branch separators remain at the deleted even key),
+                // reverse upper-bound seeks at or above those stale separators must seamlessly step into the preceding leaf
+                var rev_iter = try map.iteratorReverse();
+                var rev_expect_i: usize = COUNT - 1;
+                var rev_seen: usize = 0;
+                while (try rev_iter.prev()) |c| {
+                    const kv = try c.readKeyValuePair();
+                    var kbuf: [8]u8 = undefined;
+                    var ebuf: [8]u8 = undefined;
+                    try std.testing.expectEqualStrings(try std.mem.print(&ebuf, "k{d:0>4}", .{rev_expect_i}), try kv.key_cursor.readBytes(&kbuf));
+                    if (rev_expect_i >= 2) rev_expect_i -= 2;
+                    rev_seen += 1;
+                }
+                try std.testing.expectEqual(COUNT / 2, rev_seen);
+
+                var j_probe: usize = 2;
+                while (j_probe < COUNT) : (j_probe += 2) {
+                    var pbuf: [8]u8 = undefined;
+                    const deleted_even = try std.mem.print(&pbuf, "k{d:0>4}", .{j_probe});
+                    for ([_]bool{ true, false }) |incl| {
+                        var it_probe = try map.iteratorReverseFrom(deleted_even, incl);
+                        const prev_c = (try it_probe.prev()).?;
+                        const kv = try prev_c.readKeyValuePair();
+                        var kbuf: [8]u8 = undefined;
+                        var ebuf: [8]u8 = undefined;
+                        try std.testing.expectEqualStrings(try std.mem.print(&ebuf, "k{d:0>4}", .{j_probe - 1}), try kv.key_cursor.readBytes(&kbuf));
+                    }
+                }
             }
 
             // iterating-from on an unwritten (.none) map yields nothing, like iterator()
@@ -3526,6 +3618,12 @@ fn testSortedMap(allocator: std.mem.Allocator, comptime db_kind: xitdb.DatabaseK
                 try std.testing.expect((try it1.next()) == null);
                 var it2 = try empty.iteratorFromIndex(0);
                 try std.testing.expect((try it2.next()) == null);
+                var it3 = try empty.iteratorReverse();
+                try std.testing.expect((try it3.prev()) == null);
+                var it4 = try empty.iteratorReverseFrom("anything", true);
+                try std.testing.expect((try it4.prev()) == null);
+                var it5 = try empty.iteratorReverseFromIndex(0);
+                try std.testing.expect((try it5.prev()) == null);
             }
 
             // SortedSet with mixed short (inline) and long (external) keys
@@ -3548,6 +3646,21 @@ fn testSortedMap(allocator: std.mem.Allocator, comptime db_kind: xitdb.DatabaseK
                     n += 1;
                 }
                 try std.testing.expectEqual(3, n);
+
+                var rev_iter = try set.iteratorReverse();
+                var rev_n: usize = want.len;
+                while (try rev_iter.prev()) |c| {
+                    rev_n -= 1;
+                    const kv = try c.readKeyValuePair();
+                    var kbuf: [64]u8 = undefined;
+                    try std.testing.expectEqualStrings(want[rev_n], try kv.key_cursor.readBytes(&kbuf));
+                }
+                try std.testing.expectEqual(0, rev_n);
+
+                var rev_from = try set.iteratorReverseFrom("mid", false);
+                var kbuf: [64]u8 = undefined;
+                try std.testing.expectEqualStrings("a-much-longer-key-stored-externally", try (try (try rev_from.prev()).?.readKeyValuePair()).key_cursor.readBytes(&kbuf));
+                try std.testing.expect((try rev_from.prev()) == null);
             }
             try std.testing.expect(try set.remove("mid"));
             try std.testing.expectEqual(2, try set.count());
@@ -3732,9 +3845,27 @@ fn testIteratorFrom(allocator: std.mem.Allocator, comptime db_kind: xitdb.Databa
             }
             try std.testing.expectEqual(COUNT, expected);
         }
+        {
+            var iter = try list.iteratorReverseFrom(start);
+            var expected: i65 = @intCast(resolved);
+            while (try iter.prev()) |c| {
+                try std.testing.expectEqual(@as(u64, @intCast(expected)), try c.readUint());
+                expected -= 1;
+            }
+            try std.testing.expectEqual(-1, expected);
+        }
+        {
+            var iter = try linked.iteratorReverseFrom(start);
+            var expected: i65 = @intCast(resolved);
+            while (try iter.prev()) |c| {
+                try std.testing.expectEqual(@as(u64, @intCast(expected)), try c.readUint());
+                expected -= 1;
+            }
+            try std.testing.expectEqual(-1, expected);
+        }
     }
 
-    // iteratorFrom(0) matches a plain iterator()
+    // iteratorFrom(0) matches a plain iterator(), and iteratorReverseFrom(-1) matches iteratorReverse()
     {
         var a = try list.iterator();
         var b = try list.iteratorFrom(0);
@@ -3743,6 +3874,33 @@ fn testIteratorFrom(allocator: std.mem.Allocator, comptime db_kind: xitdb.Databa
             try std.testing.expectEqual(try ca.readUint(), try cb.readUint());
         }
         try std.testing.expect((try b.next()) == null);
+
+        var ra = try list.iteratorReverse();
+        var rb = try list.iteratorReverseFrom(-1);
+        while (try ra.prev()) |ca| {
+            const cb = (try rb.prev()).?;
+            try std.testing.expectEqual(try ca.readUint(), try cb.readUint());
+        }
+        try std.testing.expect((try rb.prev()) == null);
+
+        // HashMap reverse iterator yields exact reverse sequence of forward iterator
+        var fwd_keys: [2]u160 = undefined;
+        var m_fwd = try moment.iterator();
+        var m_idx: usize = 0;
+        while (try m_fwd.next()) |c| {
+            const kv = try c.readKeyValuePair();
+            fwd_keys[m_idx] = kv.hash;
+            m_idx += 1;
+        }
+        try std.testing.expectEqual(2, m_idx);
+
+        var m_rev = try moment.iteratorReverse();
+        while (try m_rev.prev()) |c| {
+            m_idx -= 1;
+            const kv = try c.readKeyValuePair();
+            try std.testing.expectEqual(fwd_keys[m_idx], kv.hash);
+        }
+        try std.testing.expectEqual(0, m_idx);
     }
 
     // a start out of range (past the end, or more negative than -COUNT) yields nothing
@@ -3751,6 +3909,10 @@ fn testIteratorFrom(allocator: std.mem.Allocator, comptime db_kind: xitdb.Databa
         try std.testing.expect((try li.next()) == null);
         var ki = try linked.iteratorFrom(start);
         try std.testing.expect((try ki.next()) == null);
+        var rli = try list.iteratorReverseFrom(start);
+        try std.testing.expect((try rli.prev()) == null);
+        var rki = try linked.iteratorReverseFrom(start);
+        try std.testing.expect((try rki.prev()) == null);
     }
 }
 
