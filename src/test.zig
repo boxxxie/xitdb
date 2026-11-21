@@ -5098,3 +5098,387 @@ test "reject cyclic and skewed b-trees on read-write paths" {
         try std.testing.expectError(error.InvalidBTreeNode, rem_db.runContext(LlRemoveCtx{ .rank = -1 }));
     }
 }
+
+test "reject corrupt iterator spines and premature exhaustion" {
+    const F = CorruptTreeFixture;
+    const DB = F.DB;
+    const N = F.N;
+    const allocator = std.testing.allocator;
+
+    var fix: F = undefined;
+    try fix.init(allocator);
+    defer fix.deinit();
+
+    // Iter.init() full branch validation, downward/upward header.size, and premature exhaustion
+    {
+        var trunc_buf1 = std.Io.Writer.Allocating.init(allocator);
+        defer trunc_buf1.deinit();
+        try trunc_buf1.writer.writeAll(fix.snapshot);
+        const trunc_ll_off = trunc_buf1.written().len;
+        try trunc_buf1.writer.writeAll(fix.snapshot[fix.ll_branch_off..][0 .. 2 + xitdb.SLOT_COUNT * 9]);
+        std.mem.writeInt(u64, trunc_buf1.written()[fix.ll_header_off + 8 ..][0..8], trunc_ll_off, .big);
+        var trunc_db1 = try DB.init(std.testing.io, .{ .buffer = &trunc_buf1, .max_size = 500_000 });
+        const trunc_ro1 = try DB.HashMap(.read_only).init(trunc_db1.rootCursor().readOnly());
+        const trunc_ll = try DB.LinkedArrayList(.read_only).init((try trunc_ro1.getCursor(hashInt("ll"))).?);
+        try std.testing.expectError(error.EndOfStream, trunc_ll.iterator());
+
+        var trunc_buf2 = std.Io.Writer.Allocating.init(allocator);
+        defer trunc_buf2.deinit();
+        try trunc_buf2.writer.writeAll(fix.snapshot);
+        const trunc_sm_off = trunc_buf2.written().len;
+        try trunc_buf2.writer.writeAll(fix.snapshot[fix.sm_branch_off..][0 .. 2 + xitdb.SLOT_COUNT * 9 * 2]);
+        std.mem.writeInt(u64, trunc_buf2.written()[fix.sm_header_off + 8 ..][0..8], trunc_sm_off, .big);
+        var trunc_db2 = try DB.init(std.testing.io, .{ .buffer = &trunc_buf2, .max_size = 500_000 });
+        const trunc_ro2 = try DB.HashMap(.read_only).init(trunc_db2.rootCursor().readOnly());
+        const trunc_sm = try DB.SortedMap(.read_only).init((try trunc_ro2.getCursor(hashInt("sm"))).?);
+        try std.testing.expectError(error.EndOfStream, trunc_sm.iterator());
+    }
+
+    fix.buffer.written()[fix.sm_seps_off + 9] = @backingInt(xitdb.Tag.uint);
+    try std.testing.expectError(error.InvalidBTreeNode, fix.sm.iterator());
+
+    inline for ([_]u64{ 5, 500 }) |bad_size| {
+        fix.restore();
+        std.mem.writeInt(u64, fix.buffer.written()[fix.ll_header_off..][0..8], bad_size, .big);
+        std.mem.writeInt(u64, fix.buffer.written()[fix.sm_header_off..][0..8], bad_size, .big);
+        try std.testing.expectError(error.InvalidBTreeNode, fix.ll.iterator());
+        try std.testing.expectError(error.InvalidBTreeNode, fix.sm.iterator());
+    }
+
+    fix.restore();
+    const sm_leaf1_off: usize = @intCast(std.mem.readInt(u64, fix.buffer.written()[fix.sm_branch_off + 2 + 9 + 1 ..][0..8], .big));
+    try std.testing.expectEqual(@as(u8, 0), fix.buffer.written()[sm_leaf1_off]);
+    try std.testing.expect(fix.buffer.written()[sm_leaf1_off + 1] > 0);
+    fix.buffer.written()[sm_leaf1_off + 1] = 0;
+    @memset(fix.buffer.written()[sm_leaf1_off + 2 .. sm_leaf1_off + 2 + xitdb.SLOT_COUNT * 9], 0);
+    var it_short = try fix.sm.iterator();
+    var short_count: usize = 0;
+    var short_err: ?anyerror = null;
+    while (true) {
+        if (it_short.next() catch |err| {
+            short_err = err;
+            break;
+        }) |_| {
+            short_count += 1;
+        } else break;
+    }
+    try std.testing.expect(short_count < N);
+    try std.testing.expectEqual(@as(?anyerror, error.InvalidBTreeNode), short_err);
+
+    // Sibling cycle in children[1] caught mid-iteration by B-tree level height tracking
+    fix.restore();
+    std.mem.writeInt(u64, fix.buffer.written()[fix.ll_branch_off + 2 + 9 + 1 ..][0..8], fix.ll_branch_off, .big);
+    std.mem.writeInt(u64, fix.buffer.written()[fix.sm_branch_off + 2 + 9 + 1 ..][0..8], fix.sm_branch_off, .big);
+
+    const DrainExpect = struct {
+        fn expectInvalid(iter: anytype, expected_yielded: u8) !void {
+            var it = iter;
+            var yielded: usize = 0;
+            var got_err: ?anyerror = null;
+            while (true) {
+                if (it.next() catch |err| {
+                    got_err = err;
+                    break;
+                }) |_| {
+                    yielded += 1;
+                } else break;
+            }
+            try std.testing.expectEqual(@as(usize, expected_yielded), yielded);
+            try std.testing.expectEqual(@as(?anyerror, error.InvalidBTreeNode), got_err);
+        }
+    };
+    try DrainExpect.expectInvalid(try fix.ll.iterator(), fix.ll_leaf0_num);
+    try DrainExpect.expectInvalid(try fix.ll.iteratorFrom(0), fix.ll_leaf0_num);
+    try DrainExpect.expectInvalid(try fix.sm.iterator(), fix.sm_leaf0_num);
+    try DrainExpect.expectInvalid(try fix.sm.iteratorFrom("k-00"), fix.sm_leaf0_num);
+    try DrainExpect.expectInvalid(try fix.sm.iteratorFromIndex(0), fix.sm_leaf0_num);
+
+    // Near-overflow HashMap block pointer and cyclic HAMT .index pointer
+    {
+        var hm_buf = std.Io.Writer.Allocating.init(allocator);
+        defer hm_buf.deinit();
+        var hm_db = try DB.init(std.testing.io, .{ .buffer = &hm_buf, .max_size = 500_000 });
+        const SetupHmCtx = struct {
+            pub fn run(_: @This(), cursor: *DB.Cursor(.read_write)) !void {
+                const root_map = try DB.HashMap(.read_write).init(cursor.*);
+                const sub_hm = try DB.HashMap(.read_write).init(try root_map.putCursor(hashInt("sub_hm")));
+                try sub_hm.put(hashInt("a"), .{ .uint = 1 });
+            }
+        };
+        try hm_db.runContext(SetupHmCtx{});
+
+        const hm_root_ro = try DB.HashMap(.read_only).init(hm_db.rootCursor().readOnly());
+        const sub_hm_rc = (try hm_root_ro.getCursor(hashInt("sub_hm"))).?;
+
+        var hm_overflow_rc = sub_hm_rc;
+        hm_overflow_rc.slot_ptr.slot.value = std.math.maxInt(u64) - 10;
+        const hm_overflow = try DB.HashMap(.read_only).init(hm_overflow_rc);
+        try std.testing.expectError(error.EndOfStream, hm_overflow.iterator());
+
+        const sub_hm_off: usize = @intCast(sub_hm_rc.slot_ptr.slot.value);
+        hm_buf.written()[sub_hm_off] = @backingInt(xitdb.Tag.index);
+        std.mem.writeInt(u64, hm_buf.written()[sub_hm_off + 1 ..][0..8], sub_hm_off, .big);
+        const hm_cycle = try DB.HashMap(.read_only).init(sub_hm_rc);
+        var hm_cycle_it = try hm_cycle.iterator();
+        var hm_cycle_err: ?anyerror = null;
+        while (true) {
+            if (hm_cycle_it.next() catch |err| {
+                hm_cycle_err = err;
+                break;
+            }) |_| {} else break;
+        }
+        try std.testing.expectEqual(@as(?anyerror, error.KeyOffsetExceeded), hm_cycle_err);
+    }
+}
+
+test "reject corrupt array list trie nodes while preserving slice" {
+    const F = CorruptTreeFixture;
+    const DB = F.DB;
+    const N = F.N;
+    const allocator = std.testing.allocator;
+
+    var fix: F = undefined;
+    try fix.init(allocator);
+    defer fix.deinit();
+
+    // Corrupt internal ArrayList radix-trie sibling and slot 0 tags
+    fix.buffer.written()[fix.al_root_ptr + 9] = @backingInt(xitdb.Tag.uint);
+    try std.testing.expectError(error.UnexpectedTag, fix.al.iterator());
+    try std.testing.expectError(error.UnexpectedTag, fix.al.iteratorFrom(0));
+
+    fix.buffer.written()[fix.al_root_ptr] = @backingInt(xitdb.Tag.uint);
+    try std.testing.expectError(error.UnexpectedTag, fix.al.getCursor(0));
+    try std.testing.expectError(error.UnexpectedTag, fix.al.iterator());
+    try std.testing.expectError(error.UnexpectedTag, fix.al.iteratorFrom(0));
+
+    // Corrupt ArrayList leaf-tier (sh == 0) slots to .index
+    fix.restore();
+    fix.buffer.written()[fix.al_small_root_ptr + 9] = @backingInt(xitdb.Tag.index);
+    try std.testing.expectError(error.UnexpectedTag, fix.al_small.getCursor(1));
+    try std.testing.expectError(error.UnexpectedTag, fix.al_small.iterator());
+    try std.testing.expectError(error.UnexpectedTag, fix.al_small.iteratorFrom(0));
+
+    fix.buffer.written()[fix.al_small_root_ptr] = @backingInt(xitdb.Tag.index);
+    try std.testing.expectError(error.UnexpectedTag, fix.al_small.getCursor(0));
+    try std.testing.expectError(error.UnexpectedTag, fix.al_small.iterator());
+    try std.testing.expectError(error.UnexpectedTag, fix.al_small.iteratorFrom(0));
+
+    fix.restore();
+    fix.buffer.written()[fix.al_leaf0_off + 9] = @backingInt(xitdb.Tag.index);
+    try std.testing.expectError(error.UnexpectedTag, fix.al.getCursor(1));
+    var al_leaf_it1 = try fix.al.iterator();
+    _ = (try al_leaf_it1.next()).?;
+    try std.testing.expectError(error.UnexpectedTag, al_leaf_it1.next());
+    var al_leaf_it2 = try fix.al.iteratorFrom(0);
+    _ = (try al_leaf_it2.next()).?;
+    try std.testing.expectError(error.UnexpectedTag, al_leaf_it2.next());
+
+    fix.buffer.written()[fix.al_leaf0_off] = @backingInt(xitdb.Tag.index);
+    try std.testing.expectError(error.UnexpectedTag, fix.al.getCursor(0));
+    try std.testing.expectError(error.UnexpectedTag, fix.al.iterator());
+    try std.testing.expectError(error.UnexpectedTag, fix.al.iteratorFrom(0));
+
+    // Downward- and upward-corrupted ArrayListHeader.size must fail with UnexpectedTag
+    fix.restore();
+    std.mem.writeInt(u64, fix.buffer.written()[fix.al_header_off..][0..8], 5, .big);
+    try std.testing.expectError(error.UnexpectedTag, fix.al.getCursor(2));
+    try std.testing.expectError(error.UnexpectedTag, fix.al.iterator());
+    try std.testing.expectError(error.UnexpectedTag, fix.al.iteratorFrom(2));
+
+    std.mem.writeInt(u64, fix.buffer.written()[fix.al_small_header_off..][0..8], N, .big);
+    try std.testing.expectError(error.UnexpectedTag, fix.al_small.getCursor(0));
+    try std.testing.expectError(error.UnexpectedTag, fix.al_small.iterator());
+    try std.testing.expectError(error.UnexpectedTag, fix.al_small.iteratorFrom(0));
+
+    // Active .empty() slots must fail while ArrayList.slice() stale tail slots stay valid
+    fix.restore();
+    @memset(fix.buffer.written()[fix.ll_leaf0_off + 2 ..][0..9], 0);
+    try std.testing.expectError(error.InvalidBTreeNode, fix.ll.getCursor(0));
+    try std.testing.expectError(error.InvalidBTreeNode, fix.ll.iterator());
+    try std.testing.expectError(error.InvalidBTreeNode, fix.ll.iteratorFrom(0));
+
+    fix.restore();
+    @memset(fix.buffer.written()[fix.al_small_root_ptr..][0..9], 0);
+    try std.testing.expectError(error.UnexpectedTag, fix.al_small.iterator());
+    try std.testing.expectError(error.UnexpectedTag, fix.al_small.iteratorFrom(0));
+
+    fix.restore();
+    @memset(fix.buffer.written()[fix.al_leaf0_off..][0..9], 0);
+    try std.testing.expectError(error.UnexpectedTag, fix.al.iterator());
+    try std.testing.expectError(error.UnexpectedTag, fix.al.iteratorFrom(0));
+
+    {
+        var slice_buf = std.Io.Writer.Allocating.init(allocator);
+        defer slice_buf.deinit();
+        try slice_buf.writer.writeAll(fix.snapshot);
+        var slice_db = try DB.init(std.testing.io, .{ .buffer = &slice_buf, .max_size = 500_000 });
+        const SliceCtx = struct {
+            pub fn run(_: @This(), cursor: *DB.Cursor(.read_write)) !void {
+                const root_map = try DB.HashMap(.read_write).init(cursor.*);
+                const al_rw = try DB.ArrayList(.read_write).init(try root_map.putCursor(hashInt("al")));
+                const al_small_rw = try DB.ArrayList(.read_write).init(try root_map.putCursor(hashInt("al_small")));
+                try al_rw.slice(20);
+                try al_small_rw.slice(2);
+            }
+        };
+        try slice_db.runContext(SliceCtx{});
+
+        const slice_ro = try DB.HashMap(.read_only).init(slice_db.rootCursor().readOnly());
+        const sliced_al = try DB.ArrayList(.read_only).init((try slice_ro.getCursor(hashInt("al"))).?);
+        const sliced_al_small = try DB.ArrayList(.read_only).init((try slice_ro.getCursor(hashInt("al_small"))).?);
+
+        inline for (.{
+            .{ .list = sliced_al, .expected = @as(usize, 20) },
+            .{ .list = sliced_al_small, .expected = @as(usize, 2) },
+        }) |case| {
+            var count_a: usize = 0;
+            var it_a = try case.list.iterator();
+            while (try it_a.next()) |_| count_a += 1;
+            try std.testing.expectEqual(case.expected, count_a);
+
+            var count_b: usize = 0;
+            var it_b = try case.list.iteratorFrom(0);
+            while (try it_b.next()) |_| count_b += 1;
+            try std.testing.expectEqual(case.expected, count_b);
+        }
+    }
+}
+
+test "preserve valid emptied sorted map leaves and empty fast-paths" {
+    const F = CorruptTreeFixture;
+    const DB = F.DB;
+    const N = F.N;
+    const allocator = std.testing.allocator;
+
+    var fix: F = undefined;
+    try fix.init(allocator);
+    defer fix.deinit();
+
+    // Valid SortedMap with emptied child leaves (and empty branch root after removing all keys)
+    {
+        var rem_buf = std.Io.Writer.Allocating.init(allocator);
+        defer rem_buf.deinit();
+        try rem_buf.writer.writeAll(fix.snapshot);
+        var rem_db = try DB.init(std.testing.io, .{ .buffer = &rem_buf, .max_size = 500_000 });
+        const sm_rem_counts_off = fix.sm_removed_branch_off + 2 + xitdb.SLOT_COUNT * 9 * 2;
+        const leaf0_count: usize = @intCast(std.mem.readInt(u64, rem_buf.written()[sm_rem_counts_off..][0..8], .big));
+        const RemoveRangeCtx = struct {
+            start: usize,
+            end: usize,
+            pub fn run(self: @This(), cursor: *DB.Cursor(.read_write)) !void {
+                const root_map = try DB.HashMap(.read_write).init(cursor.*);
+                const sm_rw = try DB.SortedMap(.read_write).init(try root_map.putCursor(hashInt("sm_removed")));
+                for (self.start..self.end) |i| {
+                    var kbuf: [16]u8 = undefined;
+                    const k = try std.fmt.bufPrint(&kbuf, "k-{d:0>2}", .{i});
+                    try std.testing.expect(try sm_rw.remove(k));
+                }
+            }
+        };
+        try rem_db.runContext(RemoveRangeCtx{ .start = 0, .end = leaf0_count });
+
+        {
+            const ro = try DB.HashMap(.read_only).init(rem_db.rootCursor().readOnly());
+            const sm_ro_rc = (try ro.getCursor(hashInt("sm_removed"))).?;
+            const sm_ro = try DB.SortedMap(.read_only).init(sm_ro_rc);
+            const rem_expected = N - leaf0_count;
+            try std.testing.expectEqual(@as(u64, rem_expected), try sm_ro.count());
+            var count1: usize = 0;
+            var it1 = try sm_ro.iterator();
+            while (try it1.next()) |_| count1 += 1;
+            try std.testing.expectEqual(rem_expected, count1);
+
+            var count2: usize = 0;
+            var it2 = try sm_ro.iteratorFromIndex(0);
+            while (try it2.next()) |_| count2 += 1;
+            try std.testing.expectEqual(rem_expected, count2);
+
+            var count3: usize = 0;
+            var it3 = try sm_ro.iteratorFrom("k-00");
+            while (try it3.next()) |_| count3 += 1;
+            try std.testing.expectEqual(rem_expected, count3);
+
+            try std.testing.expect((try sm_ro.getCursor("k-00")) == null);
+            try std.testing.expect((try sm_ro.getCursor("k-39")) != null);
+            try std.testing.expectEqual(@as(u64, 0), try sm_ro.rank("k-00"));
+            try std.testing.expectEqual(@as(u64, rem_expected - 1), try sm_ro.rank("k-39"));
+        }
+
+        try rem_db.runContext(RemoveRangeCtx{ .start = leaf0_count, .end = N });
+
+        {
+            const ro = try DB.HashMap(.read_only).init(rem_db.rootCursor().readOnly());
+            const sm_ro_rc = (try ro.getCursor(hashInt("sm_removed"))).?;
+            const sm_ro = try DB.SortedMap(.read_only).init(sm_ro_rc);
+            try std.testing.expectEqual(@as(u64, 0), try sm_ro.count());
+            const empty_root_off: usize = @intCast(std.mem.readInt(u64, rem_buf.written()[@intCast(sm_ro_rc.slot_ptr.slot.value + 8)..][0..8], .big));
+            try std.testing.expectEqual(@as(u8, 1), rem_buf.written()[empty_root_off]);
+            var it4 = try sm_ro.iterator();
+            try std.testing.expect((try it4.next()) == null);
+            var it5 = try sm_ro.iteratorFrom("k-00");
+            try std.testing.expect((try it5.next()) == null);
+            var it6 = try sm_ro.iteratorFromIndex(0);
+            try std.testing.expect((try it6.next()) == null);
+            try std.testing.expect((try sm_ro.getCursor("k-00")) == null);
+            try std.testing.expectEqual(@as(u64, 0), try sm_ro.rank("k-00"));
+        }
+    }
+
+    // Empty B-tree root_ptr fast-path (header.size == 0 skips reading root_ptr)
+    {
+        var empty_buf = std.Io.Writer.Allocating.init(allocator);
+        defer empty_buf.deinit();
+        var empty_db = try DB.init(std.testing.io, .{ .buffer = &empty_buf, .max_size = 500_000 });
+        const EmptySetupCtx = struct {
+            pub fn run(_: @This(), cursor: *DB.Cursor(.read_write)) !void {
+                const root_map = try DB.HashMap(.read_write).init(cursor.*);
+                _ = try DB.LinkedArrayList(.read_write).init(try root_map.putCursor(hashInt("e_ll")));
+                _ = try DB.SortedMap(.read_write).init(try root_map.putCursor(hashInt("e_sm")));
+                _ = try DB.SortedSet(.read_write).init(try root_map.putCursor(hashInt("e_ss")));
+            }
+        };
+        try empty_db.runContext(EmptySetupCtx{});
+        const e_root = try DB.HashMap(.read_only).init(empty_db.rootCursor().readOnly());
+        const e_ll_rc = (try e_root.getCursor(hashInt("e_ll"))).?;
+        const e_sm_rc = (try e_root.getCursor(hashInt("e_sm"))).?;
+        const e_ss_rc = (try e_root.getCursor(hashInt("e_ss"))).?;
+        inline for ([_]DB.Cursor(.read_only){ e_ll_rc, e_sm_rc, e_ss_rc }) |rc| {
+            std.mem.writeInt(u64, empty_buf.written()[@intCast(rc.slot_ptr.slot.value + 8)..][0..8], std.math.maxInt(u64), .big);
+        }
+        const e_ll = try DB.LinkedArrayList(.read_only).init(e_ll_rc);
+        const e_sm = try DB.SortedMap(.read_only).init(e_sm_rc);
+        const e_ss = try DB.SortedSet(.read_only).init(e_ss_rc);
+
+        try std.testing.expect((try e_sm.getCursor("a")) == null);
+        try std.testing.expectEqual(@as(u64, 0), try e_sm.rank("a"));
+        try std.testing.expect(!(try e_ss.contains("a")));
+        try std.testing.expectEqual(@as(u64, 0), try e_ss.rank("a"));
+        inline for (.{
+            try e_ll.iterator(),
+            try e_ll.iteratorFrom(0),
+            try e_sm.iterator(),
+            try e_sm.iteratorFrom("a"),
+            try e_sm.iteratorFromIndex(0),
+            try e_ss.iterator(),
+            try e_ss.iteratorFrom("a"),
+            try e_ss.iteratorFromIndex(0),
+        }) |init_it| {
+            var it_e = init_it;
+            try std.testing.expectEqual(@as(u64, 0), it_e.core.size);
+            try std.testing.expectEqual(@as(u64, 0), it_e.core.index);
+            try std.testing.expect((try it_e.next()) == null);
+        }
+    }
+
+    // Exhausted out-of-range start indices report core.size == core.index == N
+    inline for (.{
+        try fix.al.iteratorFrom(N),
+        try fix.ll.iteratorFrom(N),
+        try fix.sm.iteratorFromIndex(N),
+    }) |init_it| {
+        var it_oob = init_it;
+        try std.testing.expectEqual(@as(u64, N), it_oob.core.size);
+        try std.testing.expectEqual(@as(u64, N), it_oob.core.index);
+        try std.testing.expect((try it_oob.next()) == null);
+    }
+}
