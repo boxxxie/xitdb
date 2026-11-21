@@ -3574,7 +3574,11 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                 pub const Iter = CursorIter;
 
                 pub fn iterator(self: Cursor(write_mode)) !Iter {
-                    return try Iter.init(self);
+                    return Iter.init(self);
+                }
+
+                pub fn iteratorInto(self: Cursor(write_mode), out: *Iter) !void {
+                    try out.initInto(self);
                 }
             };
         }
@@ -4077,7 +4081,11 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                 }
 
                 pub fn iterator(self: HashMap(write_mode)) !Cursor(write_mode).Iter {
-                    return try self.cursor.iterator();
+                    return self.cursor.iterator();
+                }
+
+                pub fn iteratorInto(self: HashMap(write_mode), out: *Cursor(write_mode).Iter) !void {
+                    try self.cursor.iteratorInto(out);
                 }
 
                 pub fn getCursor(self: HashMap(write_mode), hash: HashInt) !?Cursor(.read_only) {
@@ -4178,7 +4186,11 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                 }
 
                 pub fn iterator(self: CountedHashMap(write_mode)) !Cursor(write_mode).Iter {
-                    return try self.map.iterator();
+                    return self.map.iterator();
+                }
+
+                pub fn iteratorInto(self: CountedHashMap(write_mode), out: *Cursor(write_mode).Iter) !void {
+                    try self.map.iteratorInto(out);
                 }
 
                 pub fn getCursor(self: CountedHashMap(write_mode), hash: HashInt) !?Cursor(.read_only) {
@@ -4248,7 +4260,11 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                 }
 
                 pub fn iterator(self: HashSet(write_mode)) !Cursor(write_mode).Iter {
-                    return try self.cursor.iterator();
+                    return self.cursor.iterator();
+                }
+
+                pub fn iteratorInto(self: HashSet(write_mode), out: *Cursor(write_mode).Iter) !void {
+                    try self.cursor.iteratorInto(out);
                 }
 
                 pub fn getCursor(self: HashSet(write_mode), hash: HashInt) !?Cursor(.read_only) {
@@ -4317,7 +4333,11 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                 }
 
                 pub fn iterator(self: CountedHashSet(write_mode)) !Cursor(write_mode).Iter {
-                    return try self.set.iterator();
+                    return self.set.iterator();
+                }
+
+                pub fn iteratorInto(self: CountedHashSet(write_mode), out: *Cursor(write_mode).Iter) !void {
+                    try self.set.iteratorInto(out);
                 }
 
                 pub fn getCursor(self: CountedHashSet(write_mode), hash: HashInt) !?Cursor(.read_only) {
@@ -4374,15 +4394,27 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                 }
 
                 pub fn iterator(self: SortedMap(write_mode)) !Cursor(write_mode).Iter {
-                    return try self.cursor.iterator();
+                    return self.cursor.iterator();
+                }
+
+                pub fn iteratorInto(self: SortedMap(write_mode), out: *Cursor(write_mode).Iter) !void {
+                    try self.cursor.iteratorInto(out);
                 }
 
                 pub fn iteratorFrom(self: SortedMap(write_mode), start_key: []const u8) !Cursor(write_mode).Iter {
-                    return try Cursor(write_mode).Iter.initSortedFromKey(self.cursor, start_key);
+                    return Cursor(write_mode).Iter.initSortedFromKey(self.cursor, start_key);
+                }
+
+                pub fn iteratorFromInto(self: SortedMap(write_mode), out: *Cursor(write_mode).Iter, start_key: []const u8) !void {
+                    try out.initSortedFromKeyInto(self.cursor, start_key);
                 }
 
                 pub fn iteratorFromIndex(self: SortedMap(write_mode), start_index: i65) !Cursor(write_mode).Iter {
-                    return try Cursor(write_mode).Iter.initSortedFromIndex(self.cursor, start_index);
+                    return Cursor(write_mode).Iter.initSortedFromIndex(self.cursor, start_index);
+                }
+
+                pub fn iteratorFromIndexInto(self: SortedMap(write_mode), out: *Cursor(write_mode).Iter, start_index: i65) !void {
+                    try out.initSortedFromIndexInto(self.cursor, start_index);
                 }
 
                 pub fn getCursor(self: SortedMap(write_mode), key: []const u8) !?Cursor(.read_only) {
@@ -4478,15 +4510,27 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                 }
 
                 pub fn iterator(self: SortedSet(write_mode)) !Cursor(write_mode).Iter {
-                    return try self.map.iterator();
+                    return self.map.iterator();
+                }
+
+                pub fn iteratorInto(self: SortedSet(write_mode), out: *Cursor(write_mode).Iter) !void {
+                    try self.map.iteratorInto(out);
                 }
 
                 pub fn iteratorFrom(self: SortedSet(write_mode), start_key: []const u8) !Cursor(write_mode).Iter {
-                    return try self.map.iteratorFrom(start_key);
+                    return self.map.iteratorFrom(start_key);
+                }
+
+                pub fn iteratorFromInto(self: SortedSet(write_mode), out: *Cursor(write_mode).Iter, start_key: []const u8) !void {
+                    try self.map.iteratorFromInto(out, start_key);
                 }
 
                 pub fn iteratorFromIndex(self: SortedSet(write_mode), start_index: i65) !Cursor(write_mode).Iter {
-                    return try self.map.iteratorFromIndex(start_index);
+                    return self.map.iteratorFromIndex(start_index);
+                }
+
+                pub fn iteratorFromIndexInto(self: SortedSet(write_mode), out: *Cursor(write_mode).Iter, start_index: i65) !void {
+                    try self.map.iteratorFromIndexInto(out, start_index);
                 }
 
                 pub fn put(self: SortedSet(.read_write), key: []const u8) !void {
@@ -4545,11 +4589,19 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                 }
 
                 pub fn iterator(self: ArrayList(write_mode)) !Cursor(write_mode).Iter {
-                    return try self.cursor.iterator();
+                    return self.cursor.iterator();
+                }
+
+                pub fn iteratorInto(self: ArrayList(write_mode), out: *Cursor(write_mode).Iter) !void {
+                    try self.cursor.iteratorInto(out);
                 }
 
                 pub fn iteratorFrom(self: ArrayList(write_mode), index: i65) !Cursor(write_mode).Iter {
-                    return try Cursor(write_mode).Iter.initArrayListFromIndex(self.cursor, index);
+                    return Cursor(write_mode).Iter.initArrayListFromIndex(self.cursor, index);
+                }
+
+                pub fn iteratorFromInto(self: ArrayList(write_mode), out: *Cursor(write_mode).Iter, index: i65) !void {
+                    try out.initArrayListFromIndexInto(self.cursor, index);
                 }
 
                 pub fn getCursor(self: ArrayList(write_mode), index: i65) !?Cursor(.read_only) {
@@ -4636,11 +4688,19 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                 }
 
                 pub fn iterator(self: LinkedArrayList(write_mode)) !Cursor(write_mode).Iter {
-                    return try self.cursor.iterator();
+                    return self.cursor.iterator();
+                }
+
+                pub fn iteratorInto(self: LinkedArrayList(write_mode), out: *Cursor(write_mode).Iter) !void {
+                    try self.cursor.iteratorInto(out);
                 }
 
                 pub fn iteratorFrom(self: LinkedArrayList(write_mode), index: i65) !Cursor(write_mode).Iter {
-                    return try Cursor(write_mode).Iter.initLinkedArrayListFromIndex(self.cursor, index);
+                    return Cursor(write_mode).Iter.initLinkedArrayListFromIndex(self.cursor, index);
+                }
+
+                pub fn iteratorFromInto(self: LinkedArrayList(write_mode), out: *Cursor(write_mode).Iter, index: i65) !void {
+                    try out.initLinkedArrayListFromIndexInto(self.cursor, index);
                 }
 
                 pub fn getCursor(self: LinkedArrayList(write_mode), index: i65) !?Cursor(.read_only) {
