@@ -303,16 +303,23 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
             return entry.tag == .bytes or entry.tag == .short_bytes;
         }
 
+        fn isSortedEntryTag(tag: Tag) bool {
+            return switch (tag) {
+                .bytes, .short_bytes, .kv_pair, .sorted_kv_pair => true,
+                else => false,
+            };
+        }
+
         // where a key-value entry's key slot is. a key-only entry has no separate slot.
-        fn kvKeyPosition(entry: Slot) ?u64 {
+        fn kvKeyPosition(entry: Slot) !?u64 {
             if (isKeyOnlyEntry(entry)) return null;
-            return entry.value + @as(u64, if (entry.tag == .kv_pair) byteSizeOf(HashInt) else 0);
+            return std.math.add(u64, entry.value, @as(u64, if (entry.tag == .kv_pair) byteSizeOf(HashInt) else 0)) catch return error.EndOfStream;
         }
 
         // where a key-value entry's value slot is. it follows the key slot.
-        fn kvValuePosition(entry: Slot) ?u64 {
-            const key_position = kvKeyPosition(entry) orelse return null;
-            return key_position + byteSizeOf(Slot);
+        fn kvValuePosition(entry: Slot) !?u64 {
+            const key_position = (try kvKeyPosition(entry)) orelse return null;
+            return std.math.add(u64, key_position, byteSizeOf(Slot)) catch return error.EndOfStream;
         }
 
         const BTREE_SLOT_COUNT = SLOT_COUNT; // max entries per leaf / children per branch
@@ -1185,7 +1192,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                         @intCast(index);
 
                     if (write_mode == .read_only) {
-                        const final_slot_ptr = try self.descendByRank(header.root_ptr, rank, BTREE_BRANCH_BLOCK_SIZE);
+                        const final_slot_ptr = try self.descendByRank(header, rank, BTREE_BRANCH_BLOCK_SIZE);
                         return try self.readSlotPointer(write_mode, Ctx, path[1..], final_slot_ptr, frozen_at);
                     } else {
                         // path-copy down to the value slot so the write is persistent
@@ -1423,7 +1430,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                         else => return error.UnexpectedTag,
                     }
 
-                    const index_pos = if (counted) slot_ptr.slot.value + byteSizeOf(u64) else slot_ptr.slot.value;
+                    const index_pos = if (counted) std.math.add(u64, slot_ptr.slot.value, byteSizeOf(u64)) catch return error.EndOfStream else slot_ptr.slot.value;
 
                     const res = switch (hash_map_get) {
                         .kv_pair => |kv_pair| try self.readMapSlot(index_pos, kv_pair, 0, write_mode, .kv_pair, frozen_at),
@@ -1453,7 +1460,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                         else => return error.UnexpectedTag,
                     }
 
-                    const index_pos = if (counted) slot_ptr.slot.value + byteSizeOf(u64) else slot_ptr.slot.value;
+                    const index_pos = if (counted) std.math.add(u64, slot_ptr.slot.value, byteSizeOf(u64)) catch return error.EndOfStream else slot_ptr.slot.value;
 
                     var key_found = true;
                     _ = self.removeMapSlot(index_pos, key_hash, 0, frozen_at) catch |err| switch (err) {
@@ -1573,7 +1580,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                         @intCast(index);
 
                     // return the entry so the caller can read key and value
-                    const target_slot = try self.descendByRank(header.root_ptr, rank, SORTED_BRANCH_BLOCK_SIZE);
+                    const target_slot = try self.descendByRank(header, rank, SORTED_BRANCH_BLOCK_SIZE);
                     return self.readSlotPointer(write_mode, Ctx, path[1..], target_slot, frozen_at);
                 },
                 .sorted_map_remove => |key| {
@@ -1987,6 +1994,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
             try slot.tag.validate();
 
             if (shift == 0) {
+                if (slot.tag == .index) return error.UnexpectedTag;
                 return SlotPointer{ .position = slot_pos, .slot = slot };
             }
 
@@ -2073,26 +2081,45 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
             var reader = self.core.reader();
             try reader.seekTo(ptr);
             const size = try reader.interface.readSliceShort(&block);
+            if (size < BTREE_LEAF_BLOCK_SIZE) return error.EndOfStream;
             var block_reader = std.Io.Reader.fixed(block[0..size]);
             const kind_int = try takeInt(&block_reader, u8, .big);
             const kind = std.enums.fromInt(BTreeNodeKind, kind_int) orelse return error.InvalidBTreeNodeKind;
+            if (kind == .branch and size < BTREE_BRANCH_BLOCK_SIZE) return error.EndOfStream;
             const num = try takeInt(&block_reader, u8, .big);
-            if (num > BTREE_SLOT_COUNT) return error.InvalidBTreeNode;
+            if (num > BTREE_SLOT_COUNT or (kind == .branch and num == 0)) return error.InvalidBTreeNode;
             var node = BTreeNode{ .kind = kind, .num = num };
             switch (kind) {
                 .leaf => {
-                    for (&node.values) |*s| {
+                    for (&node.values, 0..) |*s, i| {
                         s.* = @bitCast(try takeInt(&block_reader, SlotInt, .big));
                         try s.tag.validate();
+                        if (i < num) {
+                            if (s.tag == .index or s.empty()) return error.InvalidBTreeNode;
+                        } else if (!s.empty()) {
+                            return error.InvalidBTreeNode;
+                        }
                     }
                 },
                 .branch => {
-                    for (&node.children) |*s| {
+                    for (&node.children, 0..) |*s, i| {
                         s.* = @bitCast(try takeInt(&block_reader, SlotInt, .big));
                         try s.tag.validate();
+                        if (i < num) {
+                            if (s.tag != .index) return error.InvalidBTreeNode;
+                        } else if (!s.empty()) {
+                            return error.InvalidBTreeNode;
+                        }
                     }
-                    for (&node.counts) |*c| {
+                    var total: u64 = 0;
+                    for (&node.counts, 0..) |*c, i| {
                         c.* = try takeInt(&block_reader, u64, .big);
+                        if (i < num) {
+                            if (c.* == 0) return error.InvalidBTreeNode;
+                            total = std.math.add(u64, total, c.*) catch return error.InvalidBTreeNode;
+                        } else if (c.* != 0) {
+                            return error.InvalidBTreeNode;
+                        }
                     }
                 },
             }
@@ -2152,50 +2179,43 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
             return try self.writeBTreeNode(node);
         }
 
-        // descend to the slot at the given rank (0-based), decoding only the counts
-        // and slot needed from each node. linked array lists and sorted maps/sets
-        // share this because their leaves are identical and their branches start
-        // with the children and end with the counts, so only the size differs.
-        fn descendByRank(self: *Database(db_kind, HashInt), root_ptr: u64, rank: u64, comptime branch_block_size: usize) !SlotPointer {
+        // descend to the slot at the given rank (0-based), validating each node
+        // via `readSortedNode`/`readBTreeNode` so positional lookups share the
+        // exact block-validation rules used by key lookups and iterators.
+        fn descendByRank(self: *Database(db_kind, HashInt), header: BTreeHeader, rank: u64, comptime branch_block_size: usize) !SlotPointer {
             const slot_size = comptime byteSizeOf(Slot);
-            const count_size = comptime byteSizeOf(u64);
-            const counts_pos = branch_block_size - BTREE_SLOT_COUNT * count_size;
-            var reader = self.core.reader();
-            var node_ptr = root_ptr;
+            const is_sorted = branch_block_size == SORTED_BRANCH_BLOCK_SIZE;
+            const Node = if (is_sorted) SortedNode else BTreeNode;
+            var node_ptr = header.root_ptr;
+            var expected = header.size;
             var rem = rank;
-            while (true) {
-                // a leaf may be at the end of the db, so reading a whole
-                // branch's worth of bytes can come up short
-                var block: [branch_block_size]u8 = undefined;
-                try reader.seekTo(node_ptr);
-                const size = try reader.interface.readSliceShort(&block);
-                if (size < BTREE_LEAF_BLOCK_SIZE) return error.EndOfStream;
-                const kind = std.enums.fromInt(BTreeNodeKind, block[0]) orelse return error.InvalidBTreeNodeKind;
-                const num = block[1];
-                if (num > BTREE_SLOT_COUNT) return error.InvalidBTreeNode;
-                if (kind == .branch and size < branch_block_size) return error.EndOfStream;
-
-                var i: usize = 0;
-                switch (kind) {
+            var depth: usize = 0;
+            while (true) : (depth += 1) {
+                if (depth >= ITERATOR_STACK_SIZE) return error.InvalidBTreeNode;
+                const node: Node = if (is_sorted) try self.readSortedNode(node_ptr) else try self.readBTreeNode(node_ptr);
+                switch (node.kind) {
                     .leaf => {
-                        if (rem >= num) return error.InvalidBTreeNode;
-                        i = @intCast(rem);
+                        if (node.num != expected or rem >= node.num) return error.InvalidBTreeNode;
+                        const i: usize = @intCast(rem);
+                        const entries = if (is_sorted) node.entries else node.values;
+                        return .{ .position = node_ptr + BTREE_NODE_HEADER_SIZE + i * slot_size, .slot = entries[i] };
                     },
                     .branch => {
-                        while (i + 1 < num) : (i += 1) {
-                            const count = std.mem.readInt(u64, block[counts_pos + i * count_size ..][0..count_size], .big);
-                            if (rem < count) break;
-                            rem -= count;
+                        if (node.subtreeCount() != expected) return error.InvalidBTreeNode;
+                        var i: usize = 0;
+                        var found = false;
+                        for (node.counts[0..node.num], 0..) |child_count, j| {
+                            if (rem < child_count) {
+                                i = j;
+                                found = true;
+                                break;
+                            }
+                            rem -= child_count;
                         }
+                        if (!found) return error.InvalidBTreeNode;
+                        expected = node.counts[i];
+                        node_ptr = node.children[i].value;
                     },
-                }
-
-                const slot_pos = BTREE_NODE_HEADER_SIZE + i * slot_size;
-                const slot: Slot = @bitCast(std.mem.readInt(SlotInt, block[slot_pos..][0..slot_size], .big));
-                try slot.tag.validate();
-                switch (kind) {
-                    .leaf => return .{ .position = node_ptr + slot_pos, .slot = slot },
-                    .branch => node_ptr = slot.value,
                 }
             }
         }
@@ -2649,30 +2669,55 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
             var reader = self.core.reader();
             try reader.seekTo(ptr);
             const size = try reader.interface.readSliceShort(&block);
+            if (size < SORTED_LEAF_BLOCK_SIZE) return error.EndOfStream;
             var block_reader = std.Io.Reader.fixed(block[0..size]);
             const kind_int = try takeInt(&block_reader, u8, .big);
             const kind = std.enums.fromInt(SortedNodeKind, kind_int) orelse return error.InvalidBTreeNodeKind;
+            if (kind == .branch and size < SORTED_BRANCH_BLOCK_SIZE) return error.EndOfStream;
             const num = try takeInt(&block_reader, u8, .big);
-            if (num > BTREE_SLOT_COUNT) return error.InvalidBTreeNode;
+            if (num > BTREE_SLOT_COUNT or (kind == .branch and num == 0)) return error.InvalidBTreeNode;
             var node = SortedNode{ .kind = kind, .num = num };
             switch (kind) {
                 .leaf => {
-                    for (&node.entries) |*s| {
+                    for (&node.entries, 0..) |*s, i| {
                         s.* = @bitCast(try takeInt(&block_reader, SlotInt, .big));
                         try s.tag.validate();
+                        if (i < num) {
+                            if (!isSortedEntryTag(s.tag)) return error.InvalidBTreeNode;
+                        } else if (!s.empty()) {
+                            return error.InvalidBTreeNode;
+                        }
                     }
                 },
                 .branch => {
-                    for (&node.children) |*s| {
+                    for (&node.children, 0..) |*s, i| {
                         s.* = @bitCast(try takeInt(&block_reader, SlotInt, .big));
                         try s.tag.validate();
+                        if (i < num) {
+                            if (s.tag != .index) return error.InvalidBTreeNode;
+                        } else if (!s.empty()) {
+                            return error.InvalidBTreeNode;
+                        }
                     }
-                    for (&node.separators) |*s| {
+                    for (&node.separators, 0..) |*s, i| {
                         s.* = @bitCast(try takeInt(&block_reader, SlotInt, .big));
                         try s.tag.validate();
+                        if (i == 0) {
+                            if (!s.empty() and s.tag != .bytes and s.tag != .short_bytes) return error.InvalidBTreeNode;
+                        } else if (i < num) {
+                            if (s.tag != .bytes and s.tag != .short_bytes) return error.InvalidBTreeNode;
+                        } else if (!s.empty()) {
+                            return error.InvalidBTreeNode;
+                        }
                     }
-                    for (&node.counts) |*c| {
+                    var total: u64 = 0;
+                    for (&node.counts, 0..) |*c, i| {
                         c.* = try takeInt(&block_reader, u64, .big);
+                        if (i < num) {
+                            total = std.math.add(u64, total, c.*) catch return error.InvalidBTreeNode;
+                        } else if (c.* != 0) {
+                            return error.InvalidBTreeNode;
+                        }
                     }
                 },
             }
@@ -3086,7 +3131,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
             return switch (target) {
                 .kv_pair => .{ .position = null, .slot = entry },
                 .key => .{ .position = null, .slot = (try self.readKvPair(entry)).key_slot },
-                .value => .{ .position = kvValuePosition(entry), .slot = (try self.readKvPair(entry)).value_slot },
+                .value => .{ .position = try kvValuePosition(entry), .slot = (try self.readKvPair(entry)).value_slot },
             };
         }
 
@@ -3504,9 +3549,9 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     const kv_pair = try self.db.readKvPair(slot_ptr.slot);
 
                     return .{
-                        .value_cursor = .{ .slot_ptr = .{ .position = kvValuePosition(slot_ptr.slot), .slot = kv_pair.value_slot }, .db = self.db, .frozen_at = self.frozen_at },
+                        .value_cursor = .{ .slot_ptr = .{ .position = try kvValuePosition(slot_ptr.slot), .slot = kv_pair.value_slot }, .db = self.db, .frozen_at = self.frozen_at },
                         // a key-only entry is its own key slot, so its key is where the entry is
-                        .key_cursor = .{ .slot_ptr = .{ .position = kvKeyPosition(slot_ptr.slot) orelse slot_ptr.position, .slot = kv_pair.key_slot }, .db = self.db, .frozen_at = self.frozen_at },
+                        .key_cursor = .{ .slot_ptr = .{ .position = (try kvKeyPosition(slot_ptr.slot)) orelse slot_ptr.position, .slot = kv_pair.key_slot }, .db = self.db, .frozen_at = self.frozen_at },
                         .hash = kv_pair.hash,
                     };
                 }
