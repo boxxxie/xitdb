@@ -1528,6 +1528,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     const header: BTreeHeader = @bitCast(try takeInt(&reader.interface, BTreeHeaderInt, .big));
 
                     if (write_mode == .read_only) {
+                        if (header.size == 0) return error.KeyNotFound;
                         const entry = (try self.sortedGet(header.root_ptr, key)) orelse return error.KeyNotFound;
                         const target_slot = try self.sortedTargetSlot(entry, target);
                         return self.readSlotPointer(write_mode, Ctx, path[1..], target_slot, frozen_at);
@@ -1588,6 +1589,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     var reader = self.core.reader();
                     try reader.seekTo(header_ptr);
                     const header: BTreeHeader = @bitCast(try takeInt(&reader.interface, BTreeHeaderInt, .big));
+                    if (header.size == 0) return error.KeyNotFound;
 
                     const result = try self.sortedRemove(header.root_ptr, key, frozen_at);
                     if (!result.found) return error.KeyNotFound;
@@ -3601,9 +3603,9 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                                     try core_reader.seekTo(position);
                                     const header: ArrayListHeader = @bitCast(try takeInt(&core_reader.interface, ArrayListHeaderInt, .big));
                                     break :blk .{
-                                        .size = try cursor.count(),
+                                        .size = header.size,
                                         .index = 0,
-                                        .stack = try initStack(cursor, header.ptr),
+                                        .stack = if (header.size > 0) try initStack(cursor, header.ptr) else try BoundedArray(Level, ITERATOR_STACK_SIZE).init(0),
                                     };
                                 },
                                 .linked_array_list, .sorted_map, .sorted_set => blk: {
@@ -3611,10 +3613,15 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                                     var core_reader = cursor.db.core.reader();
                                     try core_reader.seekTo(position);
                                     const header: BTreeHeader = @bitCast(try takeInt(&core_reader.interface, BTreeHeaderInt, .big));
+                                    var stack = try BoundedArray(Level, ITERATOR_STACK_SIZE).init(0);
+                                    if (header.size > 0) {
+                                        const root_slots_pos = std.math.add(u64, header.root_ptr, BTREE_NODE_HEADER_SIZE) catch return error.EndOfStream;
+                                        stack = try initStack(cursor, root_slots_pos);
+                                    }
                                     break :blk .{
-                                        .size = try cursor.count(),
+                                        .size = header.size,
                                         .index = 0,
-                                        .stack = try initStack(cursor, header.root_ptr + BTREE_NODE_HEADER_SIZE),
+                                        .stack = stack,
                                     };
                                 },
                                 .hash_map, .hash_set => .{
@@ -3639,54 +3646,53 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                         return @intCast(resolved_index);
                     }
 
-                    fn emptyIter(cursor: Cursor(write_mode)) !Iter {
-                        return .{ .cursor = cursor, .core = .{ .size = 0, .index = 0, .stack = try BoundedArray(Level, ITERATOR_STACK_SIZE).init(0) } };
+                    fn exhaustedIter(cursor: Cursor(write_mode), total_size: u64) !Iter {
+                        return .{ .cursor = cursor, .core = .{ .size = total_size, .index = total_size, .stack = try BoundedArray(Level, ITERATOR_STACK_SIZE).init(0) } };
                     }
 
                     pub fn initSortedFromIndex(unresolved_cursor: Cursor(write_mode), start_index: i65) !Iter {
                         const cursor = try unresolved_cursor.resolvedCursor();
                         switch (cursor.slot_ptr.slot.tag) {
                             // an unwritten map is .none (like iterator()): yield nothing
-                            .none => return emptyIter(cursor),
+                            .none => return exhaustedIter(cursor, 0),
                             .sorted_map, .sorted_set => {},
                             else => return error.UnexpectedTag,
                         }
-                        const total = try cursor.count();
-                        const idx = resolveStartIndex(start_index, total) orelse return emptyIter(cursor);
-                        const root_ptr = try sortedRootPtr(cursor);
+                        const header = try sortedHeader(cursor);
+                        const idx = resolveStartIndex(start_index, header.size) orelse return exhaustedIter(cursor, header.size);
                         return .{
                             .cursor = cursor,
-                            .core = .{ .size = total, .index = idx, .stack = try sortedStackFromIndex(cursor, root_ptr, idx) },
+                            .core = .{ .size = header.size, .index = idx, .stack = try sortedStackFromIndex(cursor, header.root_ptr, idx) },
                         };
                     }
 
                     pub fn initSortedFromKey(unresolved_cursor: Cursor(write_mode), start_key: []const u8) !Iter {
                         const cursor = try unresolved_cursor.resolvedCursor();
                         switch (cursor.slot_ptr.slot.tag) {
-                            .none => return emptyIter(cursor),
+                            .none => return exhaustedIter(cursor, 0),
                             .sorted_map, .sorted_set => {},
                             else => return error.UnexpectedTag,
                         }
-                        const total = try cursor.count();
-                        const root_ptr = try sortedRootPtr(cursor);
-                        const built = try sortedStackFromKey(cursor, root_ptr, start_key);
+                        const header = try sortedHeader(cursor);
+                        if (header.size == 0) return exhaustedIter(cursor, 0);
+                        const built = try sortedStackFromKey(cursor, header.root_ptr, start_key);
                         return .{
                             .cursor = cursor,
-                            .core = .{ .size = total, .index = built.before, .stack = built.stack },
+                            .core = .{ .size = header.size, .index = built.before, .stack = built.stack },
                         };
                     }
 
                     pub fn initArrayListFromIndex(unresolved_cursor: Cursor(write_mode), start_index: i65) !Iter {
                         const cursor = try unresolved_cursor.resolvedCursor();
                         switch (cursor.slot_ptr.slot.tag) {
-                            .none => return emptyIter(cursor),
+                            .none => return exhaustedIter(cursor, 0),
                             .array_list => {},
                             else => return error.UnexpectedTag,
                         }
                         var core_reader = cursor.db.core.reader();
                         try core_reader.seekTo(cursor.slot_ptr.slot.value);
                         const header: ArrayListHeader = @bitCast(try takeInt(&core_reader.interface, ArrayListHeaderInt, .big));
-                        const idx = resolveStartIndex(start_index, header.size) orelse return emptyIter(cursor);
+                        const idx = resolveStartIndex(start_index, header.size) orelse return exhaustedIter(cursor, header.size);
                         const last_key = header.size - 1;
                         const shift: u6 = @intCast(if (last_key < SLOT_COUNT) 0 else std.math.log(u64, SLOT_COUNT, last_key));
                         return .{
@@ -3698,29 +3704,25 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     pub fn initLinkedArrayListFromIndex(unresolved_cursor: Cursor(write_mode), start_index: i65) !Iter {
                         const cursor = try unresolved_cursor.resolvedCursor();
                         switch (cursor.slot_ptr.slot.tag) {
-                            .none => return emptyIter(cursor),
+                            .none => return exhaustedIter(cursor, 0),
                             .linked_array_list => {},
                             else => return error.UnexpectedTag,
                         }
                         var core_reader = cursor.db.core.reader();
                         try core_reader.seekTo(cursor.slot_ptr.slot.value);
                         const header: BTreeHeader = @bitCast(try takeInt(&core_reader.interface, BTreeHeaderInt, .big));
-                        const idx = resolveStartIndex(start_index, header.size) orelse return emptyIter(cursor);
+                        const idx = resolveStartIndex(start_index, header.size) orelse return exhaustedIter(cursor, header.size);
                         return .{
                             .cursor = cursor,
                             .core = .{ .size = header.size, .index = idx, .stack = try btreeStackFromIndex(cursor, header.root_ptr, idx) },
                         };
                     }
 
-                    fn sortedRootPtr(cursor: Cursor(write_mode)) !u64 {
-                        switch (cursor.slot_ptr.slot.tag) {
-                            .sorted_map, .sorted_set => {},
-                            else => return error.UnexpectedTag,
-                        }
+                    fn sortedHeader(cursor: Cursor(write_mode)) !BTreeHeader {
+                        std.debug.assert(cursor.slot_ptr.slot.tag == .sorted_map or cursor.slot_ptr.slot.tag == .sorted_set);
                         var core_reader = cursor.db.core.reader();
                         try core_reader.seekTo(cursor.slot_ptr.slot.value);
-                        const header: BTreeHeader = @bitCast(try takeInt(&core_reader.interface, BTreeHeaderInt, .big));
-                        return header.root_ptr;
+                        return @bitCast(try takeInt(&core_reader.interface, BTreeHeaderInt, .big));
                     }
 
                     fn sortedStackFromIndex(cursor: Cursor(write_mode), root_ptr: u64, start_index: u64) !BoundedArray(Level, ITERATOR_STACK_SIZE) {
@@ -4318,6 +4320,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     var core_reader = self.cursor.db.core.reader();
                     try core_reader.seekTo(slot_ptr.slot.value);
                     const header: BTreeHeader = @bitCast(try takeInt(&core_reader.interface, BTreeHeaderInt, .big));
+                    if (header.size == 0) return 0;
                     return try self.cursor.db.sortedRank(header.root_ptr, key);
                 }
             };
