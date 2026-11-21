@@ -4366,3 +4366,226 @@ fn testRoots(
         try std.testing.expectEqual(size, try db.committedSize());
     }
 }
+
+test "empty collections skip root reads and decode work" {
+    const allocator = std.testing.allocator;
+    var buffer = std.Io.Writer.Allocating.init(allocator);
+    defer buffer.deinit();
+
+    const DB = xitdb.Database(.memory, HashInt);
+    var db = try DB.init(std.testing.io, .{ .buffer = &buffer, .max_size = 500_000 });
+
+    const SetupCtx = struct {
+        pub fn run(_: @This(), cursor: *DB.Cursor(.read_write)) !void {
+            const root_map = try DB.HashMap(.read_write).init(cursor.*);
+            _ = try DB.ArrayList(.read_write).init(try root_map.putCursor(hashInt("empty_al")));
+            _ = try DB.LinkedArrayList(.read_write).init(try root_map.putCursor(hashInt("empty_ll")));
+            _ = try DB.SortedMap(.read_write).init(try root_map.putCursor(hashInt("empty_sm")));
+            _ = try DB.SortedSet(.read_write).init(try root_map.putCursor(hashInt("empty_ss")));
+            _ = try DB.CountedHashMap(.read_write).init(try root_map.putCursor(hashInt("empty_chm")));
+            _ = try DB.CountedHashSet(.read_write).init(try root_map.putCursor(hashInt("empty_chs")));
+            _ = try DB.HashMap(.read_write).init(try root_map.putCursor(hashInt("empty_hm")));
+
+            const al_nonempty = try DB.ArrayList(.read_write).init(try root_map.putCursor(hashInt("ne_al")));
+            const ll_nonempty = try DB.LinkedArrayList(.read_write).init(try root_map.putCursor(hashInt("ne_ll")));
+            const sm_nonempty = try DB.SortedMap(.read_write).init(try root_map.putCursor(hashInt("ne_sm")));
+            const ss_nonempty = try DB.SortedSet(.read_write).init(try root_map.putCursor(hashInt("ne_ss")));
+            const chm_nonempty = try DB.CountedHashMap(.read_write).init(try root_map.putCursor(hashInt("ne_chm")));
+            const chs_nonempty = try DB.CountedHashSet(.read_write).init(try root_map.putCursor(hashInt("ne_chs")));
+            inline for (.{ "a", "b", "c" }, 0..) |k, i| {
+                try al_nonempty.append(.{ .uint = i });
+                try ll_nonempty.append(.{ .uint = i });
+                try sm_nonempty.put(k, .{ .uint = i });
+                try ss_nonempty.put(k);
+                try chm_nonempty.put(hashInt(k), .{ .uint = i });
+                try chs_nonempty.put(hashInt(k), .{ .bytes = k });
+            }
+
+            const single_chm = try DB.CountedHashMap(.read_write).init(try root_map.putCursor(hashInt("single_chm")));
+            try single_chm.put(0, .{ .uint = 42 });
+        }
+    };
+    try db.runContext(SetupCtx{});
+
+    const root_ro = try DB.HashMap(.read_only).init(db.rootCursor().readOnly());
+    const al_rc = (try root_ro.getCursor(hashInt("empty_al"))).?;
+    const ll_rc = (try root_ro.getCursor(hashInt("empty_ll"))).?;
+    const sm_rc = (try root_ro.getCursor(hashInt("empty_sm"))).?;
+    const ss_rc = (try root_ro.getCursor(hashInt("empty_ss"))).?;
+    const chm_rc = (try root_ro.getCursor(hashInt("empty_chm"))).?;
+    const chs_rc = (try root_ro.getCursor(hashInt("empty_chs"))).?;
+
+    // Point each empty collection's header ptr/root_ptr to maxInt(u64) (overflow + OOB).
+    // Because size == 0, iterator and read-only lookup/rank initialization must skip dereferencing it.
+    inline for ([_]DB.Cursor(.read_only){ al_rc, ll_rc, sm_rc, ss_rc }) |rc| {
+        std.mem.writeInt(u64, buffer.written()[@intCast(rc.slot_ptr.slot.value + 8)..][0..8], std.math.maxInt(u64), .big);
+    }
+    // Corrupt slot 0's tag byte inside empty CountedHashMap/CountedHashSet root HAMT blocks.
+    // Because count == 0, iterator initialization must skip decoding the block.
+    inline for ([_]DB.Cursor(.read_only){ chm_rc, chs_rc }) |rc| {
+        buffer.written()[@intCast(rc.slot_ptr.slot.value + 8)] = 0x7F;
+    }
+
+    const al = try DB.ArrayList(.read_only).init(al_rc);
+    const ll = try DB.LinkedArrayList(.read_only).init(ll_rc);
+    const sm = try DB.SortedMap(.read_only).init(sm_rc);
+    const ss = try DB.SortedSet(.read_only).init(ss_rc);
+    const chm = try DB.CountedHashMap(.read_only).init(chm_rc);
+    const chs = try DB.CountedHashSet(.read_only).init(chs_rc);
+
+    try std.testing.expect((try sm.getCursor("a")) == null);
+    try std.testing.expectEqual(@as(u64, 0), try sm.rank("a"));
+    try std.testing.expect(!(try ss.contains("a")));
+    try std.testing.expectEqual(@as(u64, 0), try ss.rank("a"));
+
+    inline for (.{
+        try al.iterator(),
+        try al.iteratorFrom(0),
+        try al.iteratorFrom(-1),
+        try ll.iterator(),
+        try ll.iteratorFrom(0),
+        try ll.iteratorFrom(-1),
+        try sm.iterator(),
+        try sm.iteratorFrom("a"),
+        try sm.iteratorFromIndex(0),
+        try sm.iteratorFromIndex(-1),
+        try ss.iterator(),
+        try ss.iteratorFrom("a"),
+        try ss.iteratorFromIndex(0),
+        try ss.iteratorFromIndex(-1),
+        try chm.iterator(),
+        try chs.iterator(),
+    }) |init_it| {
+        var it = init_it;
+        try std.testing.expectEqual(@as(u64, 0), it.core.size);
+        try std.testing.expectEqual(@as(usize, 0), it.core.stack.len);
+        try std.testing.expect((try it.next()) == null);
+    }
+
+    // Pre-seek overflow guard for CountedHashMap/CountedHashSet block_pos + INDEX_BLOCK_SIZE.
+    inline for ([_]DB.Cursor(.read_only){ chm_rc, chs_rc }) |rc| {
+        var overflow_rc = rc;
+        overflow_rc.slot_ptr.slot.value = std.math.maxInt(u64) - 10;
+        try std.testing.expectError(error.EndOfStream, overflow_rc.iterator());
+    }
+
+    // With size > 0 and header.root_ptr = maxInt(u64), B-tree iterators must return EndOfStream without u64 overflow/wrap.
+    inline for ([_]DB.Cursor(.read_only){ ll_rc, sm_rc }) |rc| {
+        std.mem.writeInt(u64, buffer.written()[@intCast(rc.slot_ptr.slot.value)..][0..8], 1, .big);
+    }
+    try std.testing.expectError(error.EndOfStream, ll.iterator());
+    try std.testing.expectError(error.EndOfStream, sm.iterator());
+
+    // Exhausted out-of-range start indices on non-empty collections must report size == index == header.size.
+    const ne_al = try DB.ArrayList(.read_only).init((try root_ro.getCursor(hashInt("ne_al"))).?);
+    const ne_ll = try DB.LinkedArrayList(.read_only).init((try root_ro.getCursor(hashInt("ne_ll"))).?);
+    const ne_sm = try DB.SortedMap(.read_only).init((try root_ro.getCursor(hashInt("ne_sm"))).?);
+    const ne_ss = try DB.SortedSet(.read_only).init((try root_ro.getCursor(hashInt("ne_ss"))).?);
+    const ne_chm = try DB.CountedHashMap(.read_only).init((try root_ro.getCursor(hashInt("ne_chm"))).?);
+    const ne_chs = try DB.CountedHashSet(.read_only).init((try root_ro.getCursor(hashInt("ne_chs"))).?);
+    inline for (.{
+        try ne_al.iteratorFrom(3),
+        try ne_al.iteratorFrom(-4),
+        try ne_ll.iteratorFrom(3),
+        try ne_ll.iteratorFrom(-4),
+        try ne_sm.iteratorFromIndex(3),
+        try ne_sm.iteratorFromIndex(-4),
+        try ne_ss.iteratorFromIndex(3),
+        try ne_ss.iteratorFromIndex(-4),
+    }) |init_it| {
+        var it = init_it;
+        try std.testing.expectEqual(@as(u64, 3), it.core.size);
+        try std.testing.expectEqual(@as(u64, 3), it.core.index);
+        try std.testing.expectEqual(@as(usize, 0), it.core.stack.len);
+        try std.testing.expect((try it.next()) == null);
+    }
+    inline for (.{
+        try ne_sm.iteratorFrom("z"),
+        try ne_ss.iteratorFrom("z"),
+    }) |init_it| {
+        var it = init_it;
+        try std.testing.expectEqual(@as(u64, 3), it.core.size);
+        try std.testing.expectEqual(@as(u64, 3), it.core.index);
+        try std.testing.expect((try it.next()) == null);
+    }
+
+    // Draining CountedHashMap and CountedHashSet iterators must advance core.index to match core.size.
+    inline for (.{ try ne_chm.iterator(), try ne_chs.iterator() }) |init_it| {
+        var it = init_it;
+        try std.testing.expectEqual(@as(u64, 3), it.core.size);
+        try std.testing.expectEqual(@as(u64, 0), it.core.index);
+        var count: usize = 0;
+        while (try it.next()) |_| {
+            count += 1;
+            try std.testing.expectEqual(@as(u64, count), it.core.index);
+        }
+        try std.testing.expectEqual(@as(usize, 3), count);
+        try std.testing.expectEqual(@as(u64, 3), it.core.size);
+        try std.testing.expectEqual(@as(u64, 3), it.core.index);
+    }
+
+    // CountedHashMap must stop as soon as core.index == core.size without scanning remaining slots.
+    const single_chm_rc = (try root_ro.getCursor(hashInt("single_chm"))).?;
+    const single_block_off: usize = @intCast(single_chm_rc.slot_ptr.slot.value + 8);
+    // Hash 0 occupies slot 0; corrupt trailing slot 1 with an out-of-bounds .index slot.
+    const bad_index_slot: u72 = @bitCast(xitdb.Slot{ .value = std.math.maxInt(u64), .tag = .index });
+    std.mem.writeInt(u72, buffer.written()[single_block_off + 9 ..][0..9], bad_index_slot, .big);
+    const single_chm = try DB.CountedHashMap(.read_only).init(single_chm_rc);
+    var single_it = try single_chm.iterator();
+    try std.testing.expectEqual(@as(u64, 1), single_it.core.size);
+    try std.testing.expect((try single_it.next()) != null);
+    try std.testing.expectEqual(@as(u64, 1), single_it.core.index);
+    try std.testing.expect((try single_it.next()) == null);
+    try std.testing.expectEqual(@as(u64, 1), single_it.core.index);
+
+    // Inflated CountedHashMap count returning fewer items must error rather than silently exhausting.
+    @memset(buffer.written()[single_block_off + 9 ..][0..9], 0);
+    std.mem.writeInt(u64, buffer.written()[@intCast(single_chm_rc.slot_ptr.slot.value)..][0..8], 5, .big);
+    var inflated_it = try single_chm.iterator();
+    try std.testing.expect((try inflated_it.next()) != null);
+    try std.testing.expectEqual(@as(u64, 1), inflated_it.core.index);
+    try std.testing.expectError(error.InvalidDatabase, inflated_it.next());
+    try std.testing.expectEqual(@as(u64, 1), inflated_it.core.index);
+
+    // readSlotBlock near-overflow and cyclic HAMT .index handling without BoundedArray Overflow leak.
+    const hm_rc = (try root_ro.getCursor(hashInt("empty_hm"))).?;
+    var hm_overflow_rc = hm_rc;
+    hm_overflow_rc.slot_ptr.slot.value = std.math.maxInt(u64) - 10;
+    try std.testing.expectError(error.EndOfStream, hm_overflow_rc.iterator());
+
+    const hm_block_off: usize = @intCast(hm_rc.slot_ptr.slot.value);
+    const hm_cyc_slot: u72 = @bitCast(xitdb.Slot{ .value = hm_block_off, .tag = .index });
+    std.mem.writeInt(u72, buffer.written()[hm_block_off..][0..9], hm_cyc_slot, .big);
+    var hm_cyc_it = try hm_rc.iterator();
+    try std.testing.expectError(error.KeyOffsetExceeded, hm_cyc_it.next());
+
+    // Empty SortedMap/SortedSet remove() must skip dereferencing root_ptr when header.size == 0.
+    {
+        var rem_buf = std.Io.Writer.Allocating.init(allocator);
+        defer rem_buf.deinit();
+        var rem_db = try DB.init(std.testing.io, .{ .buffer = &rem_buf, .max_size = 500_000 });
+        const EmptyInitCtx = struct {
+            pub fn run(_: @This(), cursor: *DB.Cursor(.read_write)) !void {
+                const rm = try DB.HashMap(.read_write).init(cursor.*);
+                _ = try DB.SortedMap(.read_write).init(try rm.putCursor(hashInt("empty_sm")));
+                _ = try DB.SortedSet(.read_write).init(try rm.putCursor(hashInt("empty_ss")));
+            }
+        };
+        try rem_db.runContext(EmptyInitCtx{});
+        const rem_ro = try DB.HashMap(.read_only).init(rem_db.rootCursor().readOnly());
+        inline for ([_][]const u8{ "empty_sm", "empty_ss" }) |name| {
+            const rc = (try rem_ro.getCursor(hashInt(name))).?;
+            std.mem.writeInt(u64, rem_buf.written()[@intCast(rc.slot_ptr.slot.value + 8)..][0..8], std.math.maxInt(u64), .big);
+        }
+        const EmptyRemoveCtx = struct {
+            pub fn run(_: @This(), cursor: *DB.Cursor(.read_write)) !void {
+                const rm = try DB.HashMap(.read_write).init(cursor.*);
+                const e_sm = try DB.SortedMap(.read_write).init(try rm.putCursor(hashInt("empty_sm")));
+                const e_ss = try DB.SortedSet(.read_write).init(try rm.putCursor(hashInt("empty_ss")));
+                try std.testing.expect(!(try e_sm.remove("a")));
+                try std.testing.expect(!(try e_ss.remove("a")));
+            }
+        };
+        try rem_db.runContext(EmptyRemoveCtx{});
+    }
+}
