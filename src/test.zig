@@ -4366,3 +4366,1119 @@ fn testRoots(
         try std.testing.expectEqual(size, try db.committedSize());
     }
 }
+
+const CorruptTreeFixture = struct {
+    const DB = xitdb.Database(.memory, HashInt);
+    const N: usize = 40;
+
+    allocator: std.mem.Allocator,
+    buffer: std.Io.Writer.Allocating,
+    db: DB,
+    snapshot: []u8,
+
+    ll_rc: DB.Cursor(.read_only),
+    sm_rc: DB.Cursor(.read_only),
+    al_rc: DB.Cursor(.read_only),
+    ll_small_rc: DB.Cursor(.read_only),
+    sm_small_rc: DB.Cursor(.read_only),
+    al_small_rc: DB.Cursor(.read_only),
+    chm_rc: DB.Cursor(.read_only),
+    sm_removed_rc: DB.Cursor(.read_only),
+
+    ll: DB.LinkedArrayList(.read_only),
+    sm: DB.SortedMap(.read_only),
+    al: DB.ArrayList(.read_only),
+    ll_small: DB.LinkedArrayList(.read_only),
+    sm_small: DB.SortedMap(.read_only),
+    al_small: DB.ArrayList(.read_only),
+
+    ll_header_off: usize,
+    sm_header_off: usize,
+    al_header_off: usize,
+    al_small_header_off: usize,
+
+    ll_branch_off: usize,
+    sm_branch_off: usize,
+    ll_branch_num: u8,
+    sm_branch_num: u8,
+    ll_counts_off: usize,
+    sm_counts_off: usize,
+    sm_seps_off: usize,
+
+    ll_leaf0_off: usize,
+    sm_leaf0_off: usize,
+    ll_leaf0_num: u8,
+    sm_leaf0_num: u8,
+
+    al_root_ptr: usize,
+    al_leaf0_off: usize,
+    al_small_root_ptr: usize,
+    ll_small_leaf_off: usize,
+    sm_small_leaf_off: usize,
+    sm_removed_branch_off: usize,
+
+    // Must initialize in place so `&self.buffer` stored inside `self.db` stays valid.
+    fn init(self: *CorruptTreeFixture, allocator: std.mem.Allocator) !void {
+        self.allocator = allocator;
+        self.buffer = std.Io.Writer.Allocating.init(allocator);
+        errdefer self.buffer.deinit();
+
+        self.db = try DB.init(std.testing.io, .{ .buffer = &self.buffer, .max_size = 500_000 });
+
+        const SetupCtx = struct {
+            pub fn run(_: @This(), cursor: *DB.Cursor(.read_write)) !void {
+                const root_map = try DB.HashMap(.read_write).init(cursor.*);
+                const ll = try DB.LinkedArrayList(.read_write).init(try root_map.putCursor(hashInt("ll")));
+                const sm = try DB.SortedMap(.read_write).init(try root_map.putCursor(hashInt("sm")));
+                const al = try DB.ArrayList(.read_write).init(try root_map.putCursor(hashInt("al")));
+                const sm_removed = try DB.SortedMap(.read_write).init(try root_map.putCursor(hashInt("sm_removed")));
+                for (0..N) |i| {
+                    var kbuf: [16]u8 = undefined;
+                    const k = try std.fmt.bufPrint(&kbuf, "k-{d:0>2}", .{i});
+                    try ll.append(.{ .uint = i });
+                    try sm.put(k, .{ .uint = i });
+                    try sm_removed.put(k, .{ .uint = i });
+                    try al.append(.{ .uint = i });
+                }
+
+                const ll_small = try DB.LinkedArrayList(.read_write).init(try root_map.putCursor(hashInt("ll_small")));
+                const sm_small = try DB.SortedMap(.read_write).init(try root_map.putCursor(hashInt("sm_small")));
+                const al_small = try DB.ArrayList(.read_write).init(try root_map.putCursor(hashInt("al_small")));
+                for (0..3) |i| {
+                    var kbuf: [16]u8 = undefined;
+                    const k = try std.fmt.bufPrint(&kbuf, "s-{d:0>2}", .{i});
+                    try ll_small.append(.{ .uint = i });
+                    try sm_small.put(k, .{ .uint = i });
+                    try al_small.append(.{ .uint = i });
+                }
+
+                const chm = try DB.CountedHashMap(.read_write).init(try root_map.putCursor(hashInt("chm")));
+                try chm.put(hashInt("a"), .{ .uint = 1 });
+            }
+        };
+        try self.db.runContext(SetupCtx{});
+
+        const root_ro = try DB.HashMap(.read_only).init(self.db.rootCursor().readOnly());
+        self.ll_rc = (try root_ro.getCursor(hashInt("ll"))).?;
+        self.sm_rc = (try root_ro.getCursor(hashInt("sm"))).?;
+        self.al_rc = (try root_ro.getCursor(hashInt("al"))).?;
+        self.ll_small_rc = (try root_ro.getCursor(hashInt("ll_small"))).?;
+        self.sm_small_rc = (try root_ro.getCursor(hashInt("sm_small"))).?;
+        self.al_small_rc = (try root_ro.getCursor(hashInt("al_small"))).?;
+        self.chm_rc = (try root_ro.getCursor(hashInt("chm"))).?;
+        self.sm_removed_rc = (try root_ro.getCursor(hashInt("sm_removed"))).?;
+
+        self.ll = try DB.LinkedArrayList(.read_only).init(self.ll_rc);
+        self.sm = try DB.SortedMap(.read_only).init(self.sm_rc);
+        self.al = try DB.ArrayList(.read_only).init(self.al_rc);
+        self.ll_small = try DB.LinkedArrayList(.read_only).init(self.ll_small_rc);
+        self.sm_small = try DB.SortedMap(.read_only).init(self.sm_small_rc);
+        self.al_small = try DB.ArrayList(.read_only).init(self.al_small_rc);
+
+        const data = self.buffer.written();
+        self.ll_header_off = @intCast(self.ll_rc.slot_ptr.slot.value);
+        self.sm_header_off = @intCast(self.sm_rc.slot_ptr.slot.value);
+        self.al_header_off = @intCast(self.al_rc.slot_ptr.slot.value);
+        self.al_small_header_off = @intCast(self.al_small_rc.slot_ptr.slot.value);
+
+        self.ll_branch_off = @intCast(std.mem.readInt(u64, data[self.ll_header_off + 8 ..][0..8], .big));
+        self.sm_branch_off = @intCast(std.mem.readInt(u64, data[self.sm_header_off + 8 ..][0..8], .big));
+        self.al_root_ptr = @intCast(std.mem.readInt(u64, data[self.al_header_off + 8 ..][0..8], .big));
+        self.ll_small_leaf_off = @intCast(std.mem.readInt(u64, data[@intCast(self.ll_small_rc.slot_ptr.slot.value + 8)..][0..8], .big));
+        self.sm_small_leaf_off = @intCast(std.mem.readInt(u64, data[@intCast(self.sm_small_rc.slot_ptr.slot.value + 8)..][0..8], .big));
+        self.al_small_root_ptr = @intCast(std.mem.readInt(u64, data[self.al_small_header_off + 8 ..][0..8], .big));
+        self.sm_removed_branch_off = @intCast(std.mem.readInt(u64, data[@intCast(self.sm_removed_rc.slot_ptr.slot.value + 8)..][0..8], .big));
+
+        self.ll_branch_num = data[self.ll_branch_off + 1];
+        self.sm_branch_num = data[self.sm_branch_off + 1];
+        try std.testing.expectEqual(@as(u8, 1), data[self.ll_branch_off]);
+        try std.testing.expectEqual(@as(u8, 1), data[self.sm_branch_off]);
+        try std.testing.expect(self.ll_branch_num >= 2 and self.ll_branch_num < xitdb.SLOT_COUNT);
+        try std.testing.expect(self.sm_branch_num >= 2 and self.sm_branch_num < xitdb.SLOT_COUNT);
+
+        self.ll_counts_off = self.ll_branch_off + 2 + xitdb.SLOT_COUNT * 9;
+        self.sm_seps_off = self.sm_branch_off + 2 + xitdb.SLOT_COUNT * 9;
+        self.sm_counts_off = self.sm_seps_off + xitdb.SLOT_COUNT * 9;
+
+        self.ll_leaf0_off = @intCast(std.mem.readInt(u64, data[self.ll_branch_off + 3 ..][0..8], .big));
+        self.sm_leaf0_off = @intCast(std.mem.readInt(u64, data[self.sm_branch_off + 3 ..][0..8], .big));
+        self.ll_leaf0_num = data[self.ll_leaf0_off + 1];
+        self.sm_leaf0_num = data[self.sm_leaf0_off + 1];
+        try std.testing.expectEqual(@as(u8, 0), data[self.ll_leaf0_off]);
+        try std.testing.expectEqual(@as(u8, 0), data[self.sm_leaf0_off]);
+        try std.testing.expect(self.ll_leaf0_num > 0 and self.ll_leaf0_num < xitdb.SLOT_COUNT);
+        try std.testing.expect(self.sm_leaf0_num > 0 and self.sm_leaf0_num < xitdb.SLOT_COUNT);
+
+        self.al_leaf0_off = @intCast(std.mem.readInt(u64, data[self.al_root_ptr + 1 ..][0..8], .big));
+
+        self.snapshot = try allocator.dupe(u8, data);
+    }
+
+    fn deinit(self: *CorruptTreeFixture) void {
+        self.allocator.free(self.snapshot);
+        self.buffer.deinit();
+    }
+
+    fn restore(self: *CorruptTreeFixture) void {
+        @memcpy(self.buffer.written(), self.snapshot);
+    }
+};
+
+test "reject corrupt b-tree and sorted node blocks" {
+    const F = CorruptTreeFixture;
+    const DB = F.DB;
+    const N = F.N;
+
+    var fix: F = undefined;
+    try fix.init(std.testing.allocator);
+    defer fix.deinit();
+
+    // Corrupt branch num == 0
+    fix.buffer.written()[fix.ll_branch_off + 1] = 0;
+    fix.buffer.written()[fix.sm_branch_off + 1] = 0;
+
+    try std.testing.expectError(error.InvalidBTreeNode, fix.ll.getCursor(0));
+    try std.testing.expectError(error.InvalidBTreeNode, fix.ll.iterator());
+    try std.testing.expectError(error.InvalidBTreeNode, fix.ll.iteratorFrom(0));
+    try std.testing.expectError(error.InvalidBTreeNode, fix.sm.getCursor("k-00"));
+    try std.testing.expectError(error.InvalidBTreeNode, fix.sm.getIndexKeyValuePair(0));
+    try std.testing.expectError(error.InvalidBTreeNode, fix.sm.iterator());
+    try std.testing.expectError(error.InvalidBTreeNode, fix.sm.iteratorFrom("k-00"));
+    try std.testing.expectError(error.InvalidBTreeNode, fix.sm.iteratorFromIndex(0));
+    try std.testing.expectError(error.InvalidBTreeNode, fix.sm.rank("k-00"));
+
+    // Corrupt active branch child slot tag from .index to .uint
+    fix.restore();
+    fix.buffer.written()[fix.ll_branch_off + 2] = @backingInt(xitdb.Tag.uint);
+    fix.buffer.written()[fix.sm_branch_off + 2] = @backingInt(xitdb.Tag.uint);
+
+    try std.testing.expectError(error.InvalidBTreeNode, fix.ll.getCursor(0));
+    try std.testing.expectError(error.InvalidBTreeNode, fix.ll.iterator());
+    try std.testing.expectError(error.InvalidBTreeNode, fix.ll.iteratorFrom(0));
+    try std.testing.expectError(error.InvalidBTreeNode, fix.sm.getCursor("k-00"));
+    try std.testing.expectError(error.InvalidBTreeNode, fix.sm.getIndexKeyValuePair(0));
+    try std.testing.expectError(error.InvalidBTreeNode, fix.sm.iterator());
+    try std.testing.expectError(error.InvalidBTreeNode, fix.sm.iteratorFrom("k-00"));
+    try std.testing.expectError(error.InvalidBTreeNode, fix.sm.iteratorFromIndex(0));
+    try std.testing.expectError(error.InvalidBTreeNode, fix.sm.rank("k-00"));
+
+    // Corrupt leaf rank bounds: inflated header.size and zeroed counts (rem >= 256 and node.num <= rem < 256)
+    fix.restore();
+    std.mem.writeInt(u64, fix.buffer.written()[fix.ll_header_off..][0..8], 500, .big);
+    std.mem.writeInt(u64, fix.buffer.written()[fix.sm_header_off..][0..8], 500, .big);
+    @memset(fix.buffer.written()[fix.ll_counts_off..][0 .. xitdb.SLOT_COUNT * 8], 0);
+    @memset(fix.buffer.written()[fix.sm_counts_off..][0 .. xitdb.SLOT_COUNT * 8], 0);
+
+    try std.testing.expectError(error.InvalidBTreeNode, fix.ll.getCursor(300));
+    try std.testing.expectError(error.InvalidBTreeNode, fix.ll.getCursor(20));
+    try std.testing.expectError(error.InvalidBTreeNode, fix.ll.iteratorFrom(300));
+    try std.testing.expectError(error.InvalidBTreeNode, fix.ll.iteratorFrom(20));
+    try std.testing.expectError(error.InvalidBTreeNode, fix.sm.getIndexKeyValuePair(300));
+    try std.testing.expectError(error.InvalidBTreeNode, fix.sm.getIndexKeyValuePair(20));
+    try std.testing.expectError(error.InvalidBTreeNode, fix.sm.iteratorFromIndex(300));
+    try std.testing.expectError(error.InvalidBTreeNode, fix.sm.iteratorFromIndex(20));
+
+    // Corrupt branch counts sum overflow (maxInt(u64) + 1)
+    fix.restore();
+    std.mem.writeInt(u64, fix.buffer.written()[fix.ll_counts_off..][0..8], std.math.maxInt(u64), .big);
+    std.mem.writeInt(u64, fix.buffer.written()[fix.ll_counts_off + 8 ..][0..8], 1, .big);
+    std.mem.writeInt(u64, fix.buffer.written()[fix.sm_counts_off..][0..8], std.math.maxInt(u64), .big);
+    std.mem.writeInt(u64, fix.buffer.written()[fix.sm_counts_off + 8 ..][0..8], 1, .big);
+
+    try std.testing.expectError(error.InvalidBTreeNode, fix.ll.iteratorFrom(0));
+    try std.testing.expectError(error.InvalidBTreeNode, fix.sm.rank("k-00"));
+    try std.testing.expectError(error.InvalidBTreeNode, fix.sm.iteratorFrom("k-00"));
+    try std.testing.expectError(error.InvalidBTreeNode, fix.sm.iteratorFromIndex(0));
+
+    // Corrupt active leaf slot tag from value to .index
+    fix.restore();
+    fix.buffer.written()[fix.ll_leaf0_off + 2] = @backingInt(xitdb.Tag.index);
+    fix.buffer.written()[fix.sm_leaf0_off + 2] = @backingInt(xitdb.Tag.index);
+
+    try std.testing.expectError(error.InvalidBTreeNode, fix.ll.getCursor(0));
+    try std.testing.expectError(error.InvalidBTreeNode, fix.ll.iterator());
+    try std.testing.expectError(error.InvalidBTreeNode, fix.ll.iteratorFrom(0));
+    try std.testing.expectError(error.InvalidBTreeNode, fix.sm.getCursor("k-00"));
+    try std.testing.expectError(error.InvalidBTreeNode, fix.sm.getIndexKeyValuePair(0));
+    try std.testing.expectError(error.InvalidBTreeNode, fix.sm.iterator());
+    try std.testing.expectError(error.InvalidBTreeNode, fix.sm.iteratorFrom("k-00"));
+    try std.testing.expectError(error.InvalidBTreeNode, fix.sm.iteratorFromIndex(0));
+    try std.testing.expectError(error.InvalidBTreeNode, fix.sm.rank("k-00"));
+
+    // Corrupt inactive slots (i >= num) in branch and leaf nodes to .uint and .index
+    inline for ([_]xitdb.Tag{ .uint, .index }) |bad_tag| {
+        fix.restore();
+        fix.buffer.written()[fix.ll_branch_off + 2 + fix.ll_branch_num * 9] = @backingInt(bad_tag);
+        fix.buffer.written()[fix.sm_branch_off + 2 + fix.sm_branch_num * 9] = @backingInt(bad_tag);
+        try std.testing.expectError(error.InvalidBTreeNode, fix.ll.iterator());
+        try std.testing.expectError(error.InvalidBTreeNode, fix.ll.iteratorFrom(0));
+        try std.testing.expectError(error.InvalidBTreeNode, fix.sm.getCursor("k-00"));
+        try std.testing.expectError(error.InvalidBTreeNode, fix.sm.iterator());
+        try std.testing.expectError(error.InvalidBTreeNode, fix.sm.iteratorFrom("k-00"));
+        try std.testing.expectError(error.InvalidBTreeNode, fix.sm.iteratorFromIndex(0));
+        try std.testing.expectError(error.InvalidBTreeNode, fix.sm.rank("k-00"));
+
+        fix.restore();
+        fix.buffer.written()[fix.ll_leaf0_off + 2 + fix.ll_leaf0_num * 9] = @backingInt(bad_tag);
+        fix.buffer.written()[fix.sm_leaf0_off + 2 + fix.sm_leaf0_num * 9] = @backingInt(bad_tag);
+        try std.testing.expectError(error.InvalidBTreeNode, fix.ll.iterator());
+        try std.testing.expectError(error.InvalidBTreeNode, fix.ll.iteratorFrom(0));
+        try std.testing.expectError(error.InvalidBTreeNode, fix.sm.getCursor("k-00"));
+        try std.testing.expectError(error.InvalidBTreeNode, fix.sm.iterator());
+        try std.testing.expectError(error.InvalidBTreeNode, fix.sm.iteratorFrom("k-00"));
+        try std.testing.expectError(error.InvalidBTreeNode, fix.sm.iteratorFromIndex(0));
+        try std.testing.expectError(error.InvalidBTreeNode, fix.sm.rank("k-00"));
+    }
+
+    // Corrupt SortedNode branch separators (active 1..num, sentinel 0, inactive num..)
+    for ([_]struct { off: usize, tag: xitdb.Tag }{
+        .{ .off = fix.sm_seps_off + 9, .tag = .none },
+        .{ .off = fix.sm_seps_off + 9, .tag = .index },
+        .{ .off = fix.sm_seps_off, .tag = .index },
+        .{ .off = fix.sm_seps_off + fix.sm_branch_num * 9, .tag = .uint },
+    }) |case| {
+        fix.restore();
+        fix.buffer.written()[case.off] = @backingInt(case.tag);
+        try std.testing.expectError(error.InvalidBTreeNode, fix.sm.iteratorFromIndex(0));
+        try std.testing.expectError(error.InvalidBTreeNode, fix.sm.getCursor("k-00"));
+        try std.testing.expectError(error.InvalidBTreeNode, fix.sm.rank("k-00"));
+    }
+
+    // Corrupt branch counts skew without overflow
+    // Under-reported counts = [1, 1, 0, ...] (sum != header.size)
+    fix.restore();
+    @memset(fix.buffer.written()[fix.ll_counts_off..][0 .. xitdb.SLOT_COUNT * 8], 0);
+    std.mem.writeInt(u64, fix.buffer.written()[fix.ll_counts_off..][0..8], 1, .big);
+    std.mem.writeInt(u64, fix.buffer.written()[fix.ll_counts_off + 8 ..][0..8], 1, .big);
+    @memset(fix.buffer.written()[fix.sm_counts_off..][0 .. xitdb.SLOT_COUNT * 8], 0);
+    std.mem.writeInt(u64, fix.buffer.written()[fix.sm_counts_off..][0..8], 1, .big);
+    std.mem.writeInt(u64, fix.buffer.written()[fix.sm_counts_off + 8 ..][0..8], 1, .big);
+
+    try std.testing.expectError(error.InvalidBTreeNode, fix.ll.getCursor(0));
+    try std.testing.expectError(error.InvalidBTreeNode, fix.ll.iteratorFrom(21));
+    try std.testing.expectError(error.InvalidBTreeNode, fix.sm.getCursor("k-00"));
+    try std.testing.expectError(error.InvalidBTreeNode, fix.sm.getIndexKeyValuePair(21));
+    try std.testing.expectError(error.InvalidBTreeNode, fix.sm.iteratorFrom("k-00"));
+    try std.testing.expectError(error.InvalidBTreeNode, fix.sm.iteratorFromIndex(21));
+    try std.testing.expectError(error.InvalidBTreeNode, fix.sm.rank("k-00"));
+
+    // Sibling-skewed counts = [30, 10, 0, ...] (sum == 40, leaf 0 num <= 16)
+    fix.restore();
+    @memset(fix.buffer.written()[fix.ll_counts_off..][0 .. xitdb.SLOT_COUNT * 8], 0);
+    std.mem.writeInt(u64, fix.buffer.written()[fix.ll_counts_off..][0..8], 30, .big);
+    std.mem.writeInt(u64, fix.buffer.written()[fix.ll_counts_off + 8 ..][0..8], 10, .big);
+    @memset(fix.buffer.written()[fix.sm_counts_off..][0 .. xitdb.SLOT_COUNT * 8], 0);
+    std.mem.writeInt(u64, fix.buffer.written()[fix.sm_counts_off..][0..8], 30, .big);
+    std.mem.writeInt(u64, fix.buffer.written()[fix.sm_counts_off + 8 ..][0..8], 10, .big);
+
+    try std.testing.expectError(error.InvalidBTreeNode, fix.ll.getCursor(20));
+    try std.testing.expectError(error.InvalidBTreeNode, fix.ll.iteratorFrom(20));
+    try std.testing.expectError(error.InvalidBTreeNode, fix.sm.getIndexKeyValuePair(20));
+    try std.testing.expectError(error.InvalidBTreeNode, fix.sm.iteratorFromIndex(20));
+
+    // Corrupt num == 0 leaves: non-root with count > 0, and root leaf while header.size > 0
+    fix.restore();
+    fix.buffer.written()[fix.ll_leaf0_off + 1] = 0;
+    fix.buffer.written()[fix.sm_leaf0_off + 1] = 0;
+
+    try std.testing.expectError(error.InvalidBTreeNode, fix.ll.getCursor(0));
+    try std.testing.expectError(error.InvalidBTreeNode, fix.ll.iterator());
+    try std.testing.expectError(error.InvalidBTreeNode, fix.ll.iteratorFrom(0));
+    try std.testing.expectError(error.InvalidBTreeNode, fix.sm.getCursor("k-00"));
+    try std.testing.expectError(error.InvalidBTreeNode, fix.sm.getIndexKeyValuePair(0));
+    try std.testing.expectError(error.InvalidBTreeNode, fix.sm.iteratorFrom("k-00"));
+    try std.testing.expectError(error.InvalidBTreeNode, fix.sm.iteratorFromIndex(0));
+    try std.testing.expectError(error.InvalidBTreeNode, fix.sm.rank("k-00"));
+
+    fix.restore();
+    fix.buffer.written()[fix.ll_small_leaf_off + 1] = 0;
+    fix.buffer.written()[fix.sm_small_leaf_off + 1] = 0;
+
+    try std.testing.expectError(error.InvalidBTreeNode, fix.ll_small.getCursor(0));
+    try std.testing.expectError(error.InvalidBTreeNode, fix.ll_small.iterator());
+    try std.testing.expectError(error.InvalidBTreeNode, fix.ll_small.iteratorFrom(0));
+    try std.testing.expectError(error.InvalidBTreeNode, fix.sm_small.getCursor("s-00"));
+    try std.testing.expectError(error.InvalidBTreeNode, fix.sm_small.getIndexKeyValuePair(0));
+    try std.testing.expectError(error.InvalidBTreeNode, fix.sm_small.iterator());
+    try std.testing.expectError(error.InvalidBTreeNode, fix.sm_small.iteratorFrom("s-00"));
+    try std.testing.expectError(error.InvalidBTreeNode, fix.sm_small.iteratorFromIndex(0));
+    try std.testing.expectError(error.InvalidBTreeNode, fix.sm_small.rank("s-00"));
+
+    // Pointer addition overflow (std.math.maxInt(u64)) must return error.EndOfStream without panic/wrap
+    fix.restore();
+    var chm_overflow_rc = fix.chm_rc;
+    chm_overflow_rc.slot_ptr.slot.value = std.math.maxInt(u64);
+    const chm_overflow = try DB.CountedHashMap(.read_only).init(chm_overflow_rc);
+    try std.testing.expectError(error.EndOfStream, chm_overflow.iterator());
+    try std.testing.expectError(error.EndOfStream, chm_overflow.map.getCursor(hashInt("a")));
+
+    std.mem.writeInt(u64, fix.buffer.written()[fix.ll_header_off + 8 ..][0..8], std.math.maxInt(u64), .big);
+    std.mem.writeInt(u64, fix.buffer.written()[fix.sm_header_off + 8 ..][0..8], std.math.maxInt(u64), .big);
+    try std.testing.expectError(error.EndOfStream, fix.ll.iterator());
+    try std.testing.expectError(error.EndOfStream, fix.sm.iterator());
+
+    // Corrupt active zero / inactive non-zero branch counts without overflow
+    fix.restore();
+    @memset(fix.buffer.written()[fix.ll_counts_off..][0 .. xitdb.SLOT_COUNT * 8], 0);
+    std.mem.writeInt(u64, fix.buffer.written()[fix.ll_counts_off + 8 ..][0..8], N, .big);
+    try std.testing.expectError(error.InvalidBTreeNode, fix.ll.getCursor(0));
+    try std.testing.expectError(error.InvalidBTreeNode, fix.ll.getCursor(39));
+    try std.testing.expectError(error.InvalidBTreeNode, fix.ll.iteratorFrom(0));
+
+    @memset(fix.buffer.written()[fix.sm_counts_off..][0 .. xitdb.SLOT_COUNT * 8], 0);
+    std.mem.writeInt(u64, fix.buffer.written()[fix.sm_counts_off + 8 ..][0..8], N, .big);
+    try std.testing.expectError(error.InvalidBTreeNode, fix.sm.getCursor("k-00"));
+    try std.testing.expectError(error.InvalidBTreeNode, fix.sm.iteratorFrom("k-00"));
+    try std.testing.expectError(error.InvalidBTreeNode, fix.sm.rank("k-00"));
+    try std.testing.expectError(error.InvalidBTreeNode, fix.sm.getIndexKeyValuePair(0));
+    try std.testing.expectError(error.InvalidBTreeNode, fix.sm.iteratorFromIndex(0));
+
+    fix.restore();
+    std.mem.writeInt(u64, fix.buffer.written()[fix.ll_counts_off + fix.ll_branch_num * 8 ..][0..8], 1, .big);
+    std.mem.writeInt(u64, fix.buffer.written()[fix.sm_counts_off + fix.sm_branch_num * 8 ..][0..8], 1, .big);
+    try std.testing.expectError(error.InvalidBTreeNode, fix.ll.getCursor(0));
+    try std.testing.expectError(error.InvalidBTreeNode, fix.ll.iteratorFrom(0));
+    try std.testing.expectError(error.InvalidBTreeNode, fix.sm.getCursor("k-00"));
+    try std.testing.expectError(error.InvalidBTreeNode, fix.sm.getIndexKeyValuePair(0));
+    try std.testing.expectError(error.InvalidBTreeNode, fix.sm.iteratorFrom("k-00"));
+    try std.testing.expectError(error.InvalidBTreeNode, fix.sm.iteratorFromIndex(0));
+    try std.testing.expectError(error.InvalidBTreeNode, fix.sm.rank("k-00"));
+
+    // Sibling rank lookups and truncated nodes match read*Node errors
+    fix.restore();
+    fix.buffer.written()[fix.ll_branch_off + 2] = @backingInt(xitdb.Tag.uint);
+    fix.buffer.written()[fix.sm_branch_off + 2] = @backingInt(xitdb.Tag.uint);
+    try std.testing.expectError(error.InvalidBTreeNode, fix.ll.getCursor(39));
+    try std.testing.expectError(error.InvalidBTreeNode, fix.ll.iteratorFrom(39));
+    try std.testing.expectError(error.InvalidBTreeNode, fix.sm.getIndexKeyValuePair(39));
+    try std.testing.expectError(error.InvalidBTreeNode, fix.sm.iteratorFromIndex(39));
+
+    fix.restore();
+    const trunc_off = fix.buffer.written().len - 4;
+    @memset(fix.buffer.written()[trunc_off..], 0xFF);
+    std.mem.writeInt(u64, fix.buffer.written()[fix.ll_header_off + 8 ..][0..8], trunc_off, .big);
+    std.mem.writeInt(u64, fix.buffer.written()[fix.sm_header_off + 8 ..][0..8], trunc_off, .big);
+    try std.testing.expectError(error.EndOfStream, fix.ll.getCursor(0));
+    try std.testing.expectError(error.EndOfStream, fix.ll.iteratorFrom(0));
+    try std.testing.expectError(error.EndOfStream, fix.sm.getCursor("k-00"));
+    try std.testing.expectError(error.EndOfStream, fix.sm.getIndexKeyValuePair(0));
+    try std.testing.expectError(error.EndOfStream, fix.sm.iteratorFromIndex(0));
+    try std.testing.expectError(error.EndOfStream, fix.sm.rank("k-00"));
+
+    // Reject active SortedNode leaf entries (0..num) tagged .none or scalar .uint
+    inline for ([_]xitdb.Tag{ .none, .uint }) |bad_tag| {
+        fix.restore();
+        fix.buffer.written()[fix.sm_leaf0_off + 2] = @backingInt(bad_tag);
+        try std.testing.expectError(error.InvalidBTreeNode, fix.sm.getCursor("k-00"));
+        try std.testing.expectError(error.InvalidBTreeNode, fix.sm.getIndexKeyValuePair(0));
+        try std.testing.expectError(error.InvalidBTreeNode, fix.sm.iterator());
+        try std.testing.expectError(error.InvalidBTreeNode, fix.sm.iteratorFrom("k-00"));
+        try std.testing.expectError(error.InvalidBTreeNode, fix.sm.iteratorFromIndex(0));
+        try std.testing.expectError(error.InvalidBTreeNode, fix.sm.rank("k-00"));
+    }
+
+    // kvKeyPosition/kvValuePosition overflow returns EndOfStream without wrap
+    inline for ([_]xitdb.Tag{ .kv_pair, .sorted_kv_pair }) |pair_tag| {
+        fix.restore();
+        fix.buffer.written()[fix.sm_leaf0_off + 2] = @backingInt(pair_tag);
+        std.mem.writeInt(u64, fix.buffer.written()[fix.sm_leaf0_off + 3 ..][0..8], std.math.maxInt(u64), .big);
+        try std.testing.expectError(error.EndOfStream, fix.sm.getIndexKeyValuePair(0));
+    }
+}
+
+test "reject cyclic and skewed b-trees on read-write paths" {
+    const F = CorruptTreeFixture;
+    const DB = F.DB;
+    const N = F.N;
+    const allocator = std.testing.allocator;
+
+    var fix: F = undefined;
+    try fix.init(allocator);
+    defer fix.deinit();
+
+    // Corrupt cyclic .index pointer (children[0] points back to branch) on read-only paths
+    std.mem.writeInt(u64, fix.buffer.written()[fix.ll_branch_off + 3 ..][0..8], fix.ll_branch_off, .big);
+    std.mem.writeInt(u64, fix.buffer.written()[fix.sm_branch_off + 3 ..][0..8], fix.sm_branch_off, .big);
+
+    try std.testing.expectError(error.InvalidBTreeNode, fix.ll.getCursor(0));
+    try std.testing.expectError(error.InvalidBTreeNode, fix.sm.getCursor("k-00"));
+    try std.testing.expectError(error.InvalidBTreeNode, fix.sm.getIndexKeyValuePair(0));
+    try std.testing.expectError(error.InvalidBTreeNode, fix.sm.rank("k-00"));
+    try std.testing.expectError(error.InvalidBTreeNode, fix.ll.iterator());
+    try std.testing.expectError(error.InvalidBTreeNode, fix.ll.iteratorFrom(0));
+    try std.testing.expectError(error.InvalidBTreeNode, fix.sm.iterator());
+    try std.testing.expectError(error.InvalidBTreeNode, fix.sm.iteratorFrom("k-00"));
+    try std.testing.expectError(error.InvalidBTreeNode, fix.sm.iteratorFromIndex(0));
+
+    // Single-child cyclic branch (num = 1, counts[0] = N) must return InvalidBTreeNode
+    fix.restore();
+    fix.buffer.written()[fix.ll_branch_off + 1] = 1;
+    @memset(fix.buffer.written()[fix.ll_branch_off + 2 + 9 .. fix.ll_counts_off], 0);
+    @memset(fix.buffer.written()[fix.ll_counts_off..][0 .. xitdb.SLOT_COUNT * 8], 0);
+    std.mem.writeInt(u64, fix.buffer.written()[fix.ll_counts_off..][0..8], N, .big);
+    std.mem.writeInt(u64, fix.buffer.written()[fix.ll_branch_off + 3 ..][0..8], fix.ll_branch_off, .big);
+
+    fix.buffer.written()[fix.sm_branch_off + 1] = 1;
+    @memset(fix.buffer.written()[fix.sm_branch_off + 2 + 9 .. fix.sm_counts_off], 0);
+    @memset(fix.buffer.written()[fix.sm_counts_off..][0 .. xitdb.SLOT_COUNT * 8], 0);
+    std.mem.writeInt(u64, fix.buffer.written()[fix.sm_counts_off..][0..8], N, .big);
+    std.mem.writeInt(u64, fix.buffer.written()[fix.sm_branch_off + 3 ..][0..8], fix.sm_branch_off, .big);
+
+    try std.testing.expectError(error.InvalidBTreeNode, fix.ll.iterator());
+    try std.testing.expectError(error.InvalidBTreeNode, fix.ll.iteratorFrom(0));
+    try std.testing.expectError(error.InvalidBTreeNode, fix.sm.iterator());
+    try std.testing.expectError(error.InvalidBTreeNode, fix.sm.iteratorFrom("k-00"));
+    try std.testing.expectError(error.InvalidBTreeNode, fix.sm.iteratorFromIndex(0));
+
+    // Read-write B-tree & SortedMap cycle, skewed-count, and underflow protection
+    const RwCorruption = enum { cycle, cycle_last, under_counts, skewed_counts, zero_sm_count0 };
+    const RwRunner = struct {
+        fn expectInvalid(
+            alloc: std.mem.Allocator,
+            f: *const F,
+            kind: RwCorruption,
+            op_ctx: anytype,
+        ) !void {
+            var rw_buf = std.Io.Writer.Allocating.init(alloc);
+            defer rw_buf.deinit();
+            try rw_buf.writer.writeAll(f.snapshot);
+            switch (kind) {
+                .cycle => {
+                    std.mem.writeInt(u64, rw_buf.written()[f.ll_branch_off + 3 ..][0..8], f.ll_branch_off, .big);
+                    std.mem.writeInt(u64, rw_buf.written()[f.sm_branch_off + 3 ..][0..8], f.sm_branch_off, .big);
+                },
+                .cycle_last => {
+                    std.mem.writeInt(u64, rw_buf.written()[f.ll_branch_off + 2 + (f.ll_branch_num - 1) * 9 + 1 ..][0..8], f.ll_branch_off, .big);
+                },
+                .under_counts => {
+                    @memset(rw_buf.written()[f.ll_counts_off..][0 .. xitdb.SLOT_COUNT * 8], 0);
+                    std.mem.writeInt(u64, rw_buf.written()[f.ll_counts_off..][0..8], 1, .big);
+                    std.mem.writeInt(u64, rw_buf.written()[f.ll_counts_off + 8 ..][0..8], 10, .big);
+                    @memset(rw_buf.written()[f.sm_counts_off..][0 .. xitdb.SLOT_COUNT * 8], 0);
+                    std.mem.writeInt(u64, rw_buf.written()[f.sm_counts_off..][0..8], 1, .big);
+                    std.mem.writeInt(u64, rw_buf.written()[f.sm_counts_off + 8 ..][0..8], 10, .big);
+                },
+                .skewed_counts => {
+                    @memset(rw_buf.written()[f.ll_counts_off..][0 .. xitdb.SLOT_COUNT * 8], 0);
+                    std.mem.writeInt(u64, rw_buf.written()[f.ll_counts_off..][0..8], 30, .big);
+                    std.mem.writeInt(u64, rw_buf.written()[f.ll_counts_off + 8 ..][0..8], 10, .big);
+                    @memset(rw_buf.written()[f.sm_counts_off..][0 .. xitdb.SLOT_COUNT * 8], 0);
+                    std.mem.writeInt(u64, rw_buf.written()[f.sm_counts_off..][0..8], 30, .big);
+                    std.mem.writeInt(u64, rw_buf.written()[f.sm_counts_off + 8 ..][0..8], 10, .big);
+                },
+                .zero_sm_count0 => {
+                    @memset(rw_buf.written()[f.sm_counts_off..][0 .. xitdb.SLOT_COUNT * 8], 0);
+                    std.mem.writeInt(u64, rw_buf.written()[f.sm_counts_off + 8 ..][0..8], N, .big);
+                },
+            }
+            var rw_db = try DB.init(std.testing.io, .{ .buffer = &rw_buf, .max_size = 500_000 });
+            try std.testing.expectError(error.InvalidBTreeNode, rw_db.runContext(op_ctx));
+        }
+    };
+
+    const LlPutCtx = struct {
+        rank: i65,
+        pub fn run(self: @This(), cursor: *DB.Cursor(.read_write)) !void {
+            const root_map = try DB.HashMap(.read_write).init(cursor.*);
+            const ll_rw = try DB.LinkedArrayList(.read_write).init(try root_map.putCursor(hashInt("ll")));
+            try ll_rw.put(self.rank, .{ .uint = 999 });
+        }
+    };
+    const LlAppendCtx = struct {
+        pub fn run(_: @This(), cursor: *DB.Cursor(.read_write)) !void {
+            const root_map = try DB.HashMap(.read_write).init(cursor.*);
+            const ll_rw = try DB.LinkedArrayList(.read_write).init(try root_map.putCursor(hashInt("ll")));
+            try ll_rw.append(.{ .uint = 999 });
+        }
+    };
+    const LlInsertCtx = struct {
+        rank: i65,
+        pub fn run(self: @This(), cursor: *DB.Cursor(.read_write)) !void {
+            const root_map = try DB.HashMap(.read_write).init(cursor.*);
+            const ll_rw = try DB.LinkedArrayList(.read_write).init(try root_map.putCursor(hashInt("ll")));
+            try ll_rw.insert(self.rank, .{ .uint = 999 });
+        }
+    };
+    const LlRemoveCtx = struct {
+        rank: i65,
+        pub fn run(self: @This(), cursor: *DB.Cursor(.read_write)) !void {
+            const root_map = try DB.HashMap(.read_write).init(cursor.*);
+            const ll_rw = try DB.LinkedArrayList(.read_write).init(try root_map.putCursor(hashInt("ll")));
+            try ll_rw.remove(self.rank);
+        }
+    };
+    const LlSliceCtx = struct {
+        offset: u64,
+        len: u64,
+        pub fn run(self: @This(), cursor: *DB.Cursor(.read_write)) !void {
+            const root_map = try DB.HashMap(.read_write).init(cursor.*);
+            const ll_rw = try DB.LinkedArrayList(.read_write).init(try root_map.putCursor(hashInt("ll")));
+            try ll_rw.slice(self.offset, self.len);
+        }
+    };
+    const SmPutCtx = struct {
+        pub fn run(_: @This(), cursor: *DB.Cursor(.read_write)) !void {
+            const root_map = try DB.HashMap(.read_write).init(cursor.*);
+            const sm_rw = try DB.SortedMap(.read_write).init(try root_map.putCursor(hashInt("sm")));
+            try sm_rw.put("k-00", .{ .uint = 999 });
+        }
+    };
+    const SmRemoveCtx = struct {
+        pub fn run(_: @This(), cursor: *DB.Cursor(.read_write)) !void {
+            const root_map = try DB.HashMap(.read_write).init(cursor.*);
+            const sm_rw = try DB.SortedMap(.read_write).init(try root_map.putCursor(hashInt("sm")));
+            _ = try sm_rw.remove("k-00");
+        }
+    };
+    const LlConcatCtx = struct {
+        pub fn run(_: @This(), cursor: *DB.Cursor(.read_write)) !void {
+            const root_map = try DB.HashMap(.read_write).init(cursor.*);
+            const ll_rw = try DB.LinkedArrayList(.read_write).init(try root_map.putCursor(hashInt("ll")));
+            const ll_small_rc = (try root_map.getCursor(hashInt("ll_small"))).?;
+            try ll_rw.concat(ll_small_rc.slot_ptr.slot);
+        }
+    };
+
+    try RwRunner.expectInvalid(allocator, &fix, .cycle, LlPutCtx{ .rank = 0 });
+    try RwRunner.expectInvalid(allocator, &fix, .cycle_last, LlAppendCtx{});
+    try RwRunner.expectInvalid(allocator, &fix, .cycle, LlInsertCtx{ .rank = 0 });
+    try RwRunner.expectInvalid(allocator, &fix, .cycle, LlRemoveCtx{ .rank = 0 });
+    try RwRunner.expectInvalid(allocator, &fix, .cycle, LlSliceCtx{ .offset = 0, .len = 1 });
+    try RwRunner.expectInvalid(allocator, &fix, .cycle, LlConcatCtx{});
+    try RwRunner.expectInvalid(allocator, &fix, .cycle_last, LlConcatCtx{});
+    try RwRunner.expectInvalid(allocator, &fix, .cycle, SmPutCtx{});
+    try RwRunner.expectInvalid(allocator, &fix, .cycle, SmRemoveCtx{});
+
+    inline for ([_]RwCorruption{ .under_counts, .skewed_counts }) |skew_kind| {
+        try RwRunner.expectInvalid(allocator, &fix, skew_kind, LlPutCtx{ .rank = 20 });
+        try RwRunner.expectInvalid(allocator, &fix, skew_kind, LlRemoveCtx{ .rank = 20 });
+        try RwRunner.expectInvalid(allocator, &fix, skew_kind, LlInsertCtx{ .rank = 20 });
+        try RwRunner.expectInvalid(allocator, &fix, skew_kind, LlSliceCtx{ .offset = 10, .len = 10 });
+        try RwRunner.expectInvalid(allocator, &fix, skew_kind, LlConcatCtx{});
+        try RwRunner.expectInvalid(allocator, &fix, skew_kind, SmPutCtx{});
+        try RwRunner.expectInvalid(allocator, &fix, skew_kind, SmRemoveCtx{});
+    }
+    try RwRunner.expectInvalid(allocator, &fix, .zero_sm_count0, SmRemoveCtx{});
+
+    // Height-2 + height-1 concat where tall_root.children[last] cycles back to tall_root
+    {
+        var concat_buf = std.Io.Writer.Allocating.init(allocator);
+        defer concat_buf.deinit();
+        var concat_db = try DB.init(std.testing.io, .{ .buffer = &concat_buf, .max_size = 500_000 });
+        const SetupConcatCtx = struct {
+            pub fn run(_: @This(), cursor: *DB.Cursor(.read_write)) !void {
+                const root_map = try DB.HashMap(.read_write).init(cursor.*);
+                const tall = try DB.LinkedArrayList(.read_write).init(try root_map.putCursor(hashInt("tall")));
+                for (0..280) |i| try tall.append(.{ .uint = i });
+                const short = try DB.LinkedArrayList(.read_write).init(try root_map.putCursor(hashInt("short")));
+                for (0..40) |i| try short.append(.{ .uint = i });
+            }
+        };
+        try concat_db.runContext(SetupConcatCtx{});
+
+        const concat_ro = try DB.HashMap(.read_only).init(concat_db.rootCursor().readOnly());
+        const tall_rc = (try concat_ro.getCursor(hashInt("tall"))).?;
+        const short_rc = (try concat_ro.getCursor(hashInt("short"))).?;
+        const data = concat_buf.written();
+        const tall_root_off: usize = @intCast(std.mem.readInt(u64, data[@intCast(tall_rc.slot_ptr.slot.value + 8)..][0..8], .big));
+        const short_root_off: usize = @intCast(std.mem.readInt(u64, data[@intCast(short_rc.slot_ptr.slot.value + 8)..][0..8], .big));
+        const tall_root_num = data[tall_root_off + 1];
+        const tall_child0_off: usize = @intCast(std.mem.readInt(u64, data[tall_root_off + 3 ..][0..8], .big));
+        const tall_grandchild0_off: usize = @intCast(std.mem.readInt(u64, data[tall_child0_off + 3 ..][0..8], .big));
+        const short_child0_off: usize = @intCast(std.mem.readInt(u64, data[short_root_off + 3 ..][0..8], .big));
+        try std.testing.expectEqual(@as(u8, 1), data[tall_root_off]);
+        try std.testing.expect(tall_root_num >= 2);
+        try std.testing.expectEqual(@as(u8, 1), data[tall_child0_off]);
+        try std.testing.expectEqual(@as(u8, 0), data[tall_grandchild0_off]);
+        try std.testing.expectEqual(@as(u8, 1), data[short_root_off]);
+        try std.testing.expectEqual(@as(u8, 0), data[short_child0_off]);
+
+        std.mem.writeInt(u64, data[tall_root_off + 2 + (tall_root_num - 1) * 9 + 1 ..][0..8], tall_root_off, .big);
+
+        const DoConcatCtx = struct {
+            pub fn run(_: @This(), cursor: *DB.Cursor(.read_write)) !void {
+                const root_map = try DB.HashMap(.read_write).init(cursor.*);
+                const tall_rw = try DB.LinkedArrayList(.read_write).init(try root_map.putCursor(hashInt("tall")));
+                const short_slot_rc = (try root_map.getCursor(hashInt("short"))).?;
+                try tall_rw.concat(short_slot_rc.slot_ptr.slot);
+            }
+        };
+        try std.testing.expectError(error.InvalidBTreeNode, concat_db.runContext(DoConcatCtx{}));
+    }
+
+    // SortedMap.put at header.size == maxInt(u64): overwrite succeeds, insert returns InvalidBTreeNode
+    {
+        try std.testing.expect(fix.sm_leaf0_num >= 2);
+        var max_buf = std.Io.Writer.Allocating.init(allocator);
+        defer max_buf.deinit();
+        try max_buf.writer.writeAll(fix.snapshot);
+        std.mem.writeInt(u64, max_buf.written()[fix.sm_header_off..][0..8], std.math.maxInt(u64), .big);
+        std.mem.writeInt(u64, max_buf.written()[fix.sm_counts_off..][0..8], fix.sm_leaf0_num, .big);
+        var remaining_max: u64 = @as(u64, std.math.maxInt(u64)) - fix.sm_leaf0_num;
+        for (1..fix.sm_branch_num - 1) |idx| {
+            std.mem.writeInt(u64, max_buf.written()[fix.sm_counts_off + idx * 8 ..][0..8], 1, .big);
+            remaining_max -= 1;
+        }
+        std.mem.writeInt(u64, max_buf.written()[fix.sm_counts_off + (fix.sm_branch_num - 1) * 8 ..][0..8], remaining_max, .big);
+
+        var max_db = try DB.init(std.testing.io, .{ .buffer = &max_buf, .max_size = 500_000 });
+        try max_db.runContext(SmPutCtx{});
+
+        const max_root_ro = try DB.HashMap(.read_only).init(max_db.rootCursor().readOnly());
+        const max_sm_ro = try DB.SortedMap(.read_only).init((try max_root_ro.getCursor(hashInt("sm"))).?);
+        try std.testing.expectEqual(@as(u64, 999), try (try max_sm_ro.getCursor("k-00")).?.readUint());
+
+        const SmMaxInsertCtx = struct {
+            pub fn run(_: @This(), cursor: *DB.Cursor(.read_write)) !void {
+                const root_map = try DB.HashMap(.read_write).init(cursor.*);
+                const sm_rw = try DB.SortedMap(.read_write).init(try root_map.putCursor(hashInt("sm")));
+                try sm_rw.put("k-00-new", .{ .uint = 999 });
+            }
+        };
+        try std.testing.expectError(error.InvalidBTreeNode, max_db.runContext(SmMaxInsertCtx{}));
+    }
+
+    // LinkedArrayList.remove(-1) root-shrinking loop validates promoted sibling count
+    {
+        var rem_buf = std.Io.Writer.Allocating.init(allocator);
+        defer rem_buf.deinit();
+        var rem_db = try DB.init(std.testing.io, .{ .buffer = &rem_buf, .max_size = 500_000 });
+        const SetupRemCtx = struct {
+            pub fn run(_: @This(), cursor: *DB.Cursor(.read_write)) !void {
+                const root_map = try DB.HashMap(.read_write).init(cursor.*);
+                const ll_rw = try DB.LinkedArrayList(.read_write).init(try root_map.putCursor(hashInt("ll")));
+                for (0..17) |i| try ll_rw.append(.{ .uint = i });
+            }
+        };
+        try rem_db.runContext(SetupRemCtx{});
+
+        const LlPrependCtx = struct {
+            pub fn run(_: @This(), cursor: *DB.Cursor(.read_write)) !void {
+                const root_map = try DB.HashMap(.read_write).init(cursor.*);
+                const ll_rw = try DB.LinkedArrayList(.read_write).init(try root_map.putCursor(hashInt("ll")));
+                try ll_rw.insert(0, .{ .uint = 0 });
+            }
+        };
+        // Grow children[0] to full capacity (16) so popping children[1] never merges back into one leaf.
+        while (true) {
+            const root_ro = try DB.HashMap(.read_only).init(rem_db.rootCursor().readOnly());
+            const ll_rc = (try root_ro.getCursor(hashInt("ll"))).?;
+            const data = rem_buf.written();
+            const root_off: usize = @intCast(std.mem.readInt(u64, data[@intCast(ll_rc.slot_ptr.slot.value + 8)..][0..8], .big));
+            try std.testing.expectEqual(@as(u8, 1), data[root_off]);
+            try std.testing.expectEqual(@as(u8, 2), data[root_off + 1]);
+            const c0 = std.mem.readInt(u64, data[root_off + 2 + xitdb.SLOT_COUNT * 9 ..][0..8], .big);
+            if (c0 == xitdb.SLOT_COUNT) break;
+            try rem_db.runContext(LlPrependCtx{});
+        }
+
+        while (true) {
+            const root_ro = try DB.HashMap(.read_only).init(rem_db.rootCursor().readOnly());
+            const ll_rc = (try root_ro.getCursor(hashInt("ll"))).?;
+            const data = rem_buf.written();
+            const root_off: usize = @intCast(std.mem.readInt(u64, data[@intCast(ll_rc.slot_ptr.slot.value + 8)..][0..8], .big));
+            try std.testing.expectEqual(@as(u8, 1), data[root_off]);
+            try std.testing.expectEqual(@as(u8, 2), data[root_off + 1]);
+            const c1 = std.mem.readInt(u64, data[root_off + 2 + xitdb.SLOT_COUNT * 9 + 8 ..][0..8], .big);
+            if (c1 == 1) break;
+            try rem_db.runContext(LlRemoveCtx{ .rank = -1 });
+        }
+
+        const root_ro = try DB.HashMap(.read_only).init(rem_db.rootCursor().readOnly());
+        const ll_rc = (try root_ro.getCursor(hashInt("ll"))).?;
+        const data = rem_buf.written();
+        const root_off: usize = @intCast(std.mem.readInt(u64, data[@intCast(ll_rc.slot_ptr.slot.value + 8)..][0..8], .big));
+        const leaf0_off: usize = @intCast(std.mem.readInt(u64, data[root_off + 3 ..][0..8], .big));
+        try std.testing.expectEqual(@as(u8, 0), data[leaf0_off]);
+        const orig_num = data[leaf0_off + 1];
+        try std.testing.expect(orig_num >= 2);
+        data[leaf0_off + 1] = orig_num - 1;
+        @memset(data[leaf0_off + 2 + (orig_num - 1) * 9 ..][0..9], 0);
+
+        try std.testing.expectError(error.InvalidBTreeNode, rem_db.runContext(LlRemoveCtx{ .rank = -1 }));
+    }
+}
+
+test "reject corrupt iterator spines and premature exhaustion" {
+    const F = CorruptTreeFixture;
+    const DB = F.DB;
+    const N = F.N;
+    const allocator = std.testing.allocator;
+
+    var fix: F = undefined;
+    try fix.init(allocator);
+    defer fix.deinit();
+
+    // Iter.init() full branch validation, downward/upward header.size, and premature exhaustion
+    {
+        var trunc_buf1 = std.Io.Writer.Allocating.init(allocator);
+        defer trunc_buf1.deinit();
+        try trunc_buf1.writer.writeAll(fix.snapshot);
+        const trunc_ll_off = trunc_buf1.written().len;
+        try trunc_buf1.writer.writeAll(fix.snapshot[fix.ll_branch_off..][0 .. 2 + xitdb.SLOT_COUNT * 9]);
+        std.mem.writeInt(u64, trunc_buf1.written()[fix.ll_header_off + 8 ..][0..8], trunc_ll_off, .big);
+        var trunc_db1 = try DB.init(std.testing.io, .{ .buffer = &trunc_buf1, .max_size = 500_000 });
+        const trunc_ro1 = try DB.HashMap(.read_only).init(trunc_db1.rootCursor().readOnly());
+        const trunc_ll = try DB.LinkedArrayList(.read_only).init((try trunc_ro1.getCursor(hashInt("ll"))).?);
+        try std.testing.expectError(error.EndOfStream, trunc_ll.iterator());
+
+        var trunc_buf2 = std.Io.Writer.Allocating.init(allocator);
+        defer trunc_buf2.deinit();
+        try trunc_buf2.writer.writeAll(fix.snapshot);
+        const trunc_sm_off = trunc_buf2.written().len;
+        try trunc_buf2.writer.writeAll(fix.snapshot[fix.sm_branch_off..][0 .. 2 + xitdb.SLOT_COUNT * 9 * 2]);
+        std.mem.writeInt(u64, trunc_buf2.written()[fix.sm_header_off + 8 ..][0..8], trunc_sm_off, .big);
+        var trunc_db2 = try DB.init(std.testing.io, .{ .buffer = &trunc_buf2, .max_size = 500_000 });
+        const trunc_ro2 = try DB.HashMap(.read_only).init(trunc_db2.rootCursor().readOnly());
+        const trunc_sm = try DB.SortedMap(.read_only).init((try trunc_ro2.getCursor(hashInt("sm"))).?);
+        try std.testing.expectError(error.EndOfStream, trunc_sm.iterator());
+    }
+
+    fix.buffer.written()[fix.sm_seps_off + 9] = @backingInt(xitdb.Tag.uint);
+    try std.testing.expectError(error.InvalidBTreeNode, fix.sm.iterator());
+
+    inline for ([_]u64{ 5, 500 }) |bad_size| {
+        fix.restore();
+        std.mem.writeInt(u64, fix.buffer.written()[fix.ll_header_off..][0..8], bad_size, .big);
+        std.mem.writeInt(u64, fix.buffer.written()[fix.sm_header_off..][0..8], bad_size, .big);
+        try std.testing.expectError(error.InvalidBTreeNode, fix.ll.iterator());
+        try std.testing.expectError(error.InvalidBTreeNode, fix.sm.iterator());
+    }
+
+    fix.restore();
+    const sm_leaf1_off: usize = @intCast(std.mem.readInt(u64, fix.buffer.written()[fix.sm_branch_off + 2 + 9 + 1 ..][0..8], .big));
+    try std.testing.expectEqual(@as(u8, 0), fix.buffer.written()[sm_leaf1_off]);
+    try std.testing.expect(fix.buffer.written()[sm_leaf1_off + 1] > 0);
+    fix.buffer.written()[sm_leaf1_off + 1] = 0;
+    @memset(fix.buffer.written()[sm_leaf1_off + 2 .. sm_leaf1_off + 2 + xitdb.SLOT_COUNT * 9], 0);
+    var it_short = try fix.sm.iterator();
+    var short_count: usize = 0;
+    var short_err: ?anyerror = null;
+    while (true) {
+        if (it_short.next() catch |err| {
+            short_err = err;
+            break;
+        }) |_| {
+            short_count += 1;
+        } else break;
+    }
+    try std.testing.expect(short_count < N);
+    try std.testing.expectEqual(@as(?anyerror, error.InvalidBTreeNode), short_err);
+
+    // Sibling cycle in children[1] caught mid-iteration by B-tree level height tracking
+    fix.restore();
+    std.mem.writeInt(u64, fix.buffer.written()[fix.ll_branch_off + 2 + 9 + 1 ..][0..8], fix.ll_branch_off, .big);
+    std.mem.writeInt(u64, fix.buffer.written()[fix.sm_branch_off + 2 + 9 + 1 ..][0..8], fix.sm_branch_off, .big);
+
+    const DrainExpect = struct {
+        fn expectInvalid(iter: anytype, expected_yielded: u8) !void {
+            var it = iter;
+            var yielded: usize = 0;
+            var got_err: ?anyerror = null;
+            while (true) {
+                if (it.next() catch |err| {
+                    got_err = err;
+                    break;
+                }) |_| {
+                    yielded += 1;
+                } else break;
+            }
+            try std.testing.expectEqual(@as(usize, expected_yielded), yielded);
+            try std.testing.expectEqual(@as(?anyerror, error.InvalidBTreeNode), got_err);
+        }
+    };
+    try DrainExpect.expectInvalid(try fix.ll.iterator(), fix.ll_leaf0_num);
+    try DrainExpect.expectInvalid(try fix.ll.iteratorFrom(0), fix.ll_leaf0_num);
+    try DrainExpect.expectInvalid(try fix.sm.iterator(), fix.sm_leaf0_num);
+    try DrainExpect.expectInvalid(try fix.sm.iteratorFrom("k-00"), fix.sm_leaf0_num);
+    try DrainExpect.expectInvalid(try fix.sm.iteratorFromIndex(0), fix.sm_leaf0_num);
+
+    // Near-overflow HashMap block pointer and cyclic HAMT .index pointer
+    {
+        var hm_buf = std.Io.Writer.Allocating.init(allocator);
+        defer hm_buf.deinit();
+        var hm_db = try DB.init(std.testing.io, .{ .buffer = &hm_buf, .max_size = 500_000 });
+        const SetupHmCtx = struct {
+            pub fn run(_: @This(), cursor: *DB.Cursor(.read_write)) !void {
+                const root_map = try DB.HashMap(.read_write).init(cursor.*);
+                const sub_hm = try DB.HashMap(.read_write).init(try root_map.putCursor(hashInt("sub_hm")));
+                try sub_hm.put(hashInt("a"), .{ .uint = 1 });
+            }
+        };
+        try hm_db.runContext(SetupHmCtx{});
+
+        const hm_root_ro = try DB.HashMap(.read_only).init(hm_db.rootCursor().readOnly());
+        const sub_hm_rc = (try hm_root_ro.getCursor(hashInt("sub_hm"))).?;
+
+        var hm_overflow_rc = sub_hm_rc;
+        hm_overflow_rc.slot_ptr.slot.value = std.math.maxInt(u64) - 10;
+        const hm_overflow = try DB.HashMap(.read_only).init(hm_overflow_rc);
+        try std.testing.expectError(error.EndOfStream, hm_overflow.iterator());
+
+        const sub_hm_off: usize = @intCast(sub_hm_rc.slot_ptr.slot.value);
+        hm_buf.written()[sub_hm_off] = @backingInt(xitdb.Tag.index);
+        std.mem.writeInt(u64, hm_buf.written()[sub_hm_off + 1 ..][0..8], sub_hm_off, .big);
+        const hm_cycle = try DB.HashMap(.read_only).init(sub_hm_rc);
+        var hm_cycle_it = try hm_cycle.iterator();
+        var hm_cycle_err: ?anyerror = null;
+        while (true) {
+            if (hm_cycle_it.next() catch |err| {
+                hm_cycle_err = err;
+                break;
+            }) |_| {} else break;
+        }
+        try std.testing.expectEqual(@as(?anyerror, error.KeyOffsetExceeded), hm_cycle_err);
+    }
+}
+
+test "reject corrupt array list trie nodes while preserving slice" {
+    const F = CorruptTreeFixture;
+    const DB = F.DB;
+    const N = F.N;
+    const allocator = std.testing.allocator;
+
+    var fix: F = undefined;
+    try fix.init(allocator);
+    defer fix.deinit();
+
+    // Corrupt internal ArrayList radix-trie sibling and slot 0 tags
+    fix.buffer.written()[fix.al_root_ptr + 9] = @backingInt(xitdb.Tag.uint);
+    try std.testing.expectError(error.UnexpectedTag, fix.al.iterator());
+    try std.testing.expectError(error.UnexpectedTag, fix.al.iteratorFrom(0));
+
+    fix.buffer.written()[fix.al_root_ptr] = @backingInt(xitdb.Tag.uint);
+    try std.testing.expectError(error.UnexpectedTag, fix.al.getCursor(0));
+    try std.testing.expectError(error.UnexpectedTag, fix.al.iterator());
+    try std.testing.expectError(error.UnexpectedTag, fix.al.iteratorFrom(0));
+
+    // Corrupt ArrayList leaf-tier (sh == 0) slots to .index
+    fix.restore();
+    fix.buffer.written()[fix.al_small_root_ptr + 9] = @backingInt(xitdb.Tag.index);
+    try std.testing.expectError(error.UnexpectedTag, fix.al_small.getCursor(1));
+    try std.testing.expectError(error.UnexpectedTag, fix.al_small.iterator());
+    try std.testing.expectError(error.UnexpectedTag, fix.al_small.iteratorFrom(0));
+
+    fix.buffer.written()[fix.al_small_root_ptr] = @backingInt(xitdb.Tag.index);
+    try std.testing.expectError(error.UnexpectedTag, fix.al_small.getCursor(0));
+    try std.testing.expectError(error.UnexpectedTag, fix.al_small.iterator());
+    try std.testing.expectError(error.UnexpectedTag, fix.al_small.iteratorFrom(0));
+
+    fix.restore();
+    fix.buffer.written()[fix.al_leaf0_off + 9] = @backingInt(xitdb.Tag.index);
+    try std.testing.expectError(error.UnexpectedTag, fix.al.getCursor(1));
+    var al_leaf_it1 = try fix.al.iterator();
+    _ = (try al_leaf_it1.next()).?;
+    try std.testing.expectError(error.UnexpectedTag, al_leaf_it1.next());
+    var al_leaf_it2 = try fix.al.iteratorFrom(0);
+    _ = (try al_leaf_it2.next()).?;
+    try std.testing.expectError(error.UnexpectedTag, al_leaf_it2.next());
+
+    fix.buffer.written()[fix.al_leaf0_off] = @backingInt(xitdb.Tag.index);
+    try std.testing.expectError(error.UnexpectedTag, fix.al.getCursor(0));
+    try std.testing.expectError(error.UnexpectedTag, fix.al.iterator());
+    try std.testing.expectError(error.UnexpectedTag, fix.al.iteratorFrom(0));
+
+    // Downward- and upward-corrupted ArrayListHeader.size must fail with UnexpectedTag
+    fix.restore();
+    std.mem.writeInt(u64, fix.buffer.written()[fix.al_header_off..][0..8], 5, .big);
+    try std.testing.expectError(error.UnexpectedTag, fix.al.getCursor(2));
+    try std.testing.expectError(error.UnexpectedTag, fix.al.iterator());
+    try std.testing.expectError(error.UnexpectedTag, fix.al.iteratorFrom(2));
+
+    std.mem.writeInt(u64, fix.buffer.written()[fix.al_small_header_off..][0..8], N, .big);
+    try std.testing.expectError(error.UnexpectedTag, fix.al_small.getCursor(0));
+    try std.testing.expectError(error.UnexpectedTag, fix.al_small.iterator());
+    try std.testing.expectError(error.UnexpectedTag, fix.al_small.iteratorFrom(0));
+
+    // Active .empty() slots must fail while ArrayList.slice() stale tail slots stay valid
+    fix.restore();
+    @memset(fix.buffer.written()[fix.ll_leaf0_off + 2 ..][0..9], 0);
+    try std.testing.expectError(error.InvalidBTreeNode, fix.ll.getCursor(0));
+    try std.testing.expectError(error.InvalidBTreeNode, fix.ll.iterator());
+    try std.testing.expectError(error.InvalidBTreeNode, fix.ll.iteratorFrom(0));
+
+    fix.restore();
+    @memset(fix.buffer.written()[fix.al_small_root_ptr..][0..9], 0);
+    try std.testing.expectError(error.UnexpectedTag, fix.al_small.iterator());
+    try std.testing.expectError(error.UnexpectedTag, fix.al_small.iteratorFrom(0));
+
+    fix.restore();
+    @memset(fix.buffer.written()[fix.al_leaf0_off..][0..9], 0);
+    try std.testing.expectError(error.UnexpectedTag, fix.al.iterator());
+    try std.testing.expectError(error.UnexpectedTag, fix.al.iteratorFrom(0));
+
+    {
+        var slice_buf = std.Io.Writer.Allocating.init(allocator);
+        defer slice_buf.deinit();
+        try slice_buf.writer.writeAll(fix.snapshot);
+        var slice_db = try DB.init(std.testing.io, .{ .buffer = &slice_buf, .max_size = 500_000 });
+        const SliceCtx = struct {
+            pub fn run(_: @This(), cursor: *DB.Cursor(.read_write)) !void {
+                const root_map = try DB.HashMap(.read_write).init(cursor.*);
+                const al_rw = try DB.ArrayList(.read_write).init(try root_map.putCursor(hashInt("al")));
+                const al_small_rw = try DB.ArrayList(.read_write).init(try root_map.putCursor(hashInt("al_small")));
+                try al_rw.slice(20);
+                try al_small_rw.slice(2);
+            }
+        };
+        try slice_db.runContext(SliceCtx{});
+
+        const slice_ro = try DB.HashMap(.read_only).init(slice_db.rootCursor().readOnly());
+        const sliced_al = try DB.ArrayList(.read_only).init((try slice_ro.getCursor(hashInt("al"))).?);
+        const sliced_al_small = try DB.ArrayList(.read_only).init((try slice_ro.getCursor(hashInt("al_small"))).?);
+
+        inline for (.{
+            .{ .list = sliced_al, .expected = @as(usize, 20) },
+            .{ .list = sliced_al_small, .expected = @as(usize, 2) },
+        }) |case| {
+            var count_a: usize = 0;
+            var it_a = try case.list.iterator();
+            while (try it_a.next()) |_| count_a += 1;
+            try std.testing.expectEqual(case.expected, count_a);
+
+            var count_b: usize = 0;
+            var it_b = try case.list.iteratorFrom(0);
+            while (try it_b.next()) |_| count_b += 1;
+            try std.testing.expectEqual(case.expected, count_b);
+        }
+    }
+}
+
+test "preserve valid emptied sorted map leaves and empty fast-paths" {
+    const F = CorruptTreeFixture;
+    const DB = F.DB;
+    const N = F.N;
+    const allocator = std.testing.allocator;
+
+    var fix: F = undefined;
+    try fix.init(allocator);
+    defer fix.deinit();
+
+    // Valid SortedMap with emptied child leaves (and empty branch root after removing all keys)
+    {
+        var rem_buf = std.Io.Writer.Allocating.init(allocator);
+        defer rem_buf.deinit();
+        try rem_buf.writer.writeAll(fix.snapshot);
+        var rem_db = try DB.init(std.testing.io, .{ .buffer = &rem_buf, .max_size = 500_000 });
+        const sm_rem_counts_off = fix.sm_removed_branch_off + 2 + xitdb.SLOT_COUNT * 9 * 2;
+        const leaf0_count: usize = @intCast(std.mem.readInt(u64, rem_buf.written()[sm_rem_counts_off..][0..8], .big));
+        const RemoveRangeCtx = struct {
+            start: usize,
+            end: usize,
+            pub fn run(self: @This(), cursor: *DB.Cursor(.read_write)) !void {
+                const root_map = try DB.HashMap(.read_write).init(cursor.*);
+                const sm_rw = try DB.SortedMap(.read_write).init(try root_map.putCursor(hashInt("sm_removed")));
+                for (self.start..self.end) |i| {
+                    var kbuf: [16]u8 = undefined;
+                    const k = try std.fmt.bufPrint(&kbuf, "k-{d:0>2}", .{i});
+                    try std.testing.expect(try sm_rw.remove(k));
+                }
+            }
+        };
+        try rem_db.runContext(RemoveRangeCtx{ .start = 0, .end = leaf0_count });
+
+        {
+            const ro = try DB.HashMap(.read_only).init(rem_db.rootCursor().readOnly());
+            const sm_ro_rc = (try ro.getCursor(hashInt("sm_removed"))).?;
+            const sm_ro = try DB.SortedMap(.read_only).init(sm_ro_rc);
+            const rem_expected = N - leaf0_count;
+            try std.testing.expectEqual(@as(u64, rem_expected), try sm_ro.count());
+            var count1: usize = 0;
+            var it1 = try sm_ro.iterator();
+            while (try it1.next()) |_| count1 += 1;
+            try std.testing.expectEqual(rem_expected, count1);
+
+            var count2: usize = 0;
+            var it2 = try sm_ro.iteratorFromIndex(0);
+            while (try it2.next()) |_| count2 += 1;
+            try std.testing.expectEqual(rem_expected, count2);
+
+            var count3: usize = 0;
+            var it3 = try sm_ro.iteratorFrom("k-00");
+            while (try it3.next()) |_| count3 += 1;
+            try std.testing.expectEqual(rem_expected, count3);
+
+            try std.testing.expect((try sm_ro.getCursor("k-00")) == null);
+            try std.testing.expect((try sm_ro.getCursor("k-39")) != null);
+            try std.testing.expectEqual(@as(u64, 0), try sm_ro.rank("k-00"));
+            try std.testing.expectEqual(@as(u64, rem_expected - 1), try sm_ro.rank("k-39"));
+        }
+
+        try rem_db.runContext(RemoveRangeCtx{ .start = leaf0_count, .end = N });
+
+        {
+            const ro = try DB.HashMap(.read_only).init(rem_db.rootCursor().readOnly());
+            const sm_ro_rc = (try ro.getCursor(hashInt("sm_removed"))).?;
+            const sm_ro = try DB.SortedMap(.read_only).init(sm_ro_rc);
+            try std.testing.expectEqual(@as(u64, 0), try sm_ro.count());
+            const empty_root_off: usize = @intCast(std.mem.readInt(u64, rem_buf.written()[@intCast(sm_ro_rc.slot_ptr.slot.value + 8)..][0..8], .big));
+            try std.testing.expectEqual(@as(u8, 1), rem_buf.written()[empty_root_off]);
+            var it4 = try sm_ro.iterator();
+            try std.testing.expect((try it4.next()) == null);
+            var it5 = try sm_ro.iteratorFrom("k-00");
+            try std.testing.expect((try it5.next()) == null);
+            var it6 = try sm_ro.iteratorFromIndex(0);
+            try std.testing.expect((try it6.next()) == null);
+            try std.testing.expect((try sm_ro.getCursor("k-00")) == null);
+            try std.testing.expectEqual(@as(u64, 0), try sm_ro.rank("k-00"));
+        }
+    }
+
+    // Empty B-tree root_ptr fast-path (header.size == 0 skips reading root_ptr)
+    {
+        var empty_buf = std.Io.Writer.Allocating.init(allocator);
+        defer empty_buf.deinit();
+        var empty_db = try DB.init(std.testing.io, .{ .buffer = &empty_buf, .max_size = 500_000 });
+        const EmptySetupCtx = struct {
+            pub fn run(_: @This(), cursor: *DB.Cursor(.read_write)) !void {
+                const root_map = try DB.HashMap(.read_write).init(cursor.*);
+                _ = try DB.LinkedArrayList(.read_write).init(try root_map.putCursor(hashInt("e_ll")));
+                _ = try DB.SortedMap(.read_write).init(try root_map.putCursor(hashInt("e_sm")));
+                _ = try DB.SortedSet(.read_write).init(try root_map.putCursor(hashInt("e_ss")));
+            }
+        };
+        try empty_db.runContext(EmptySetupCtx{});
+        const e_root = try DB.HashMap(.read_only).init(empty_db.rootCursor().readOnly());
+        const e_ll_rc = (try e_root.getCursor(hashInt("e_ll"))).?;
+        const e_sm_rc = (try e_root.getCursor(hashInt("e_sm"))).?;
+        const e_ss_rc = (try e_root.getCursor(hashInt("e_ss"))).?;
+        inline for ([_]DB.Cursor(.read_only){ e_ll_rc, e_sm_rc, e_ss_rc }) |rc| {
+            std.mem.writeInt(u64, empty_buf.written()[@intCast(rc.slot_ptr.slot.value + 8)..][0..8], std.math.maxInt(u64), .big);
+        }
+        const e_ll = try DB.LinkedArrayList(.read_only).init(e_ll_rc);
+        const e_sm = try DB.SortedMap(.read_only).init(e_sm_rc);
+        const e_ss = try DB.SortedSet(.read_only).init(e_ss_rc);
+
+        try std.testing.expect((try e_sm.getCursor("a")) == null);
+        try std.testing.expectEqual(@as(u64, 0), try e_sm.rank("a"));
+        try std.testing.expect(!(try e_ss.contains("a")));
+        try std.testing.expectEqual(@as(u64, 0), try e_ss.rank("a"));
+        inline for (.{
+            try e_ll.iterator(),
+            try e_ll.iteratorFrom(0),
+            try e_sm.iterator(),
+            try e_sm.iteratorFrom("a"),
+            try e_sm.iteratorFromIndex(0),
+            try e_ss.iterator(),
+            try e_ss.iteratorFrom("a"),
+            try e_ss.iteratorFromIndex(0),
+        }) |init_it| {
+            var it_e = init_it;
+            try std.testing.expectEqual(@as(u64, 0), it_e.core.size);
+            try std.testing.expectEqual(@as(u64, 0), it_e.core.index);
+            try std.testing.expect((try it_e.next()) == null);
+        }
+    }
+
+    // Exhausted out-of-range start indices report core.size == core.index == N
+    inline for (.{
+        try fix.al.iteratorFrom(N),
+        try fix.ll.iteratorFrom(N),
+        try fix.sm.iteratorFromIndex(N),
+    }) |init_it| {
+        var it_oob = init_it;
+        try std.testing.expectEqual(@as(u64, N), it_oob.core.size);
+        try std.testing.expectEqual(@as(u64, N), it_oob.core.index);
+        try std.testing.expect((try it_oob.next()) == null);
+    }
+}
