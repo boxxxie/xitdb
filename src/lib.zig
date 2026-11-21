@@ -3574,6 +3574,8 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                 }
 
                 pub const Iter = struct {
+                    const MAX_HASH_DEPTH = (HASH_SIZE * 8) / BIT_COUNT;
+
                     cursor: Cursor(write_mode),
                     core: struct {
                         size: u64,
@@ -3629,10 +3631,29 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                                     .index = 0,
                                     .stack = try initStack(cursor, cursor.slot_ptr.slot.value),
                                 },
-                                .counted_hash_map, .counted_hash_set => .{
-                                    .size = 0,
-                                    .index = 0,
-                                    .stack = try initStack(cursor, cursor.slot_ptr.slot.value + byteSizeOf(u64)),
+                                .counted_hash_map, .counted_hash_set => blk: {
+                                    const count_len = comptime byteSizeOf(u64);
+                                    const position = cursor.slot_ptr.slot.value;
+                                    const block_pos = std.math.add(u64, position, count_len) catch return error.EndOfStream;
+                                    _ = std.math.add(u64, block_pos, INDEX_BLOCK_SIZE) catch return error.EndOfStream;
+                                    var core_reader = cursor.db.core.reader();
+                                    try core_reader.seekTo(position);
+                                    var raw: [count_len + INDEX_BLOCK_SIZE]u8 = undefined;
+                                    try core_reader.interface.readSliceAll(&raw);
+                                    const total = std.mem.readInt(u64, raw[0..count_len], .big);
+                                    var stack = try BoundedArray(Level, ITERATOR_STACK_SIZE).init(0);
+                                    if (total > 0) {
+                                        try stack.append(.{
+                                            .position = block_pos,
+                                            .block = try decodeSlotBlock(raw[count_len..][0..INDEX_BLOCK_SIZE]),
+                                            .index = 0,
+                                        });
+                                    }
+                                    break :blk .{
+                                        .size = total,
+                                        .index = 0,
+                                        .stack = stack,
+                                    };
                                 },
                                 else => return error.UnexpectedTag,
                             },
@@ -3827,35 +3848,51 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                             .none => return null,
                             .array_list => {
                                 if (self.core.index == self.core.size) return null;
+                                const item = try self.nextInternal(0);
+                                if (item == null) return error.UnexpectedTag;
                                 self.core.index += 1;
-                                return try self.nextInternal(0);
+                                return item;
                             },
                             .linked_array_list, .sorted_map, .sorted_set => {
                                 if (self.core.index == self.core.size) return null;
-                                self.core.index += 1;
                                 // b-tree nodes have a kind+num header before their slots,
                                 // so child pointers are offset by BTREE_NODE_HEADER_SIZE
-                                return try self.nextInternal(BTREE_NODE_HEADER_SIZE);
+                                const item = try self.nextInternal(BTREE_NODE_HEADER_SIZE);
+                                if (item == null) return error.InvalidBTreeNode;
+                                self.core.index += 1;
+                                return item;
                             },
-                            .hash_map, .hash_set, .counted_hash_map, .counted_hash_set => return try self.nextInternal(0),
+                            .counted_hash_map, .counted_hash_set => {
+                                if (self.core.index == self.core.size) return null;
+                                const item = try self.nextInternal(0);
+                                if (item == null) return error.InvalidDatabase;
+                                self.core.index += 1;
+                                return item;
+                            },
+                            .hash_map, .hash_set => return try self.nextInternal(0),
                             else => return error.UnexpectedTag,
                         }
                     }
 
-                    // read a 16-slot index block (the iterable structures all use
-                    // 9-byte slots in their index/node blocks)
-                    fn readSlotBlock(cursor: Cursor(write_mode), position: u64) ![SLOT_COUNT]Slot {
-                        var core_reader = cursor.db.core.reader();
-                        try core_reader.seekTo(position);
-                        var index_block_bytes: [INDEX_BLOCK_SIZE]u8 = @splat(0);
-                        try core_reader.interface.readSliceAll(&index_block_bytes);
+                    fn decodeSlotBlock(index_block_bytes: *const [INDEX_BLOCK_SIZE]u8) ![SLOT_COUNT]Slot {
                         var index_block: [SLOT_COUNT]Slot = undefined;
-                        var block_reader = std.Io.Reader.fixed(&index_block_bytes);
+                        var block_reader = std.Io.Reader.fixed(index_block_bytes);
                         for (&index_block) |*block_slot| {
                             block_slot.* = @bitCast(try takeInt(&block_reader, SlotInt, .big));
                             try block_slot.tag.validate();
                         }
                         return index_block;
+                    }
+
+                    // read a 16-slot index block (the iterable structures all use
+                    // 9-byte slots in their index/node blocks)
+                    fn readSlotBlock(cursor: Cursor(write_mode), position: u64) ![SLOT_COUNT]Slot {
+                        _ = std.math.add(u64, position, INDEX_BLOCK_SIZE) catch return error.EndOfStream;
+                        var core_reader = cursor.db.core.reader();
+                        try core_reader.seekTo(position);
+                        var index_block_bytes: [INDEX_BLOCK_SIZE]u8 = @splat(0);
+                        try core_reader.interface.readSliceAll(&index_block_bytes);
+                        return try decodeSlotBlock(&index_block_bytes);
                     }
 
                     fn initStack(cursor: Cursor(write_mode), position: u64) !BoundedArray(Level, ITERATOR_STACK_SIZE) {
@@ -3881,12 +3918,25 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                                 const next_slot = level.block[level.index];
                                 if (next_slot.tag == .index) {
                                     // node_offset skips a b-tree node's kind+num header
-                                    const next_pos = next_slot.value + node_offset;
-                                    try self.core.stack.append(.{
+                                    const next_pos = std.math.add(u64, next_slot.value, node_offset) catch return error.EndOfStream;
+                                    switch (self.cursor.slot_ptr.slot.tag) {
+                                        .hash_map, .hash_set, .counted_hash_map, .counted_hash_set => {
+                                            if (self.core.stack.len >= MAX_HASH_DEPTH) return error.KeyOffsetExceeded;
+                                        },
+                                        .linked_array_list, .sorted_map, .sorted_set => {
+                                            if (self.core.stack.len >= ITERATOR_STACK_SIZE) return error.InvalidBTreeNode;
+                                        },
+                                        .array_list => {
+                                            if (self.core.stack.len >= ITERATOR_STACK_SIZE) return error.UnexpectedTag;
+                                        },
+                                        else => return error.UnexpectedTag,
+                                    }
+                                    const child_block = try readSlotBlock(self.cursor, next_pos);
+                                    self.core.stack.append(.{
                                         .position = next_pos,
-                                        .block = try readSlotBlock(self.cursor, next_pos),
+                                        .block = child_block,
                                         .index = 0,
-                                    });
+                                    }) catch unreachable;
                                     continue;
                                 } else {
                                     self.core.stack.slice()[self.core.stack.slice().len - 1].index += 1;
