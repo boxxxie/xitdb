@@ -3705,10 +3705,21 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                         stack: BoundedArray(Level, ITERATOR_STACK_SIZE),
                     },
 
+                    pub const LevelKind = enum {
+                        any,
+                        btree_branch,
+                        btree_leaf,
+                        array_branch,
+                        array_leaf,
+                    };
+
                     pub const Level = struct {
                         position: u64,
                         block: [SLOT_COUNT]Slot,
                         index: u8,
+                        count: u8 = SLOT_COUNT,
+                        shift: u8 = 0,
+                        kind: LevelKind = .any,
                     };
 
                     pub fn init(unresolved_cursor: Cursor(write_mode)) !Iter {
@@ -3727,9 +3738,9 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                                     try core_reader.seekTo(position);
                                     const header: ArrayListHeader = @bitCast(try takeInt(&core_reader.interface, ArrayListHeaderInt, .big));
                                     break :blk .{
-                                        .size = try cursor.count(),
+                                        .size = header.size,
                                         .index = 0,
-                                        .stack = try initStack(cursor, header.ptr),
+                                        .stack = try initArrayListStack(cursor, header),
                                     };
                                 },
                                 .linked_array_list, .sorted_map, .sorted_set => blk: {
@@ -3738,9 +3749,9 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                                     try core_reader.seekTo(position);
                                     const header: BTreeHeader = @bitCast(try takeInt(&core_reader.interface, BTreeHeaderInt, .big));
                                     break :blk .{
-                                        .size = try cursor.count(),
+                                        .size = header.size,
                                         .index = 0,
-                                        .stack = try initStack(cursor, header.root_ptr + BTREE_NODE_HEADER_SIZE),
+                                        .stack = try initBTreeStack(cursor, header),
                                     };
                                 },
                                 .hash_map, .hash_set => .{
@@ -3748,10 +3759,13 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                                     .index = 0,
                                     .stack = try initStack(cursor, cursor.slot_ptr.slot.value),
                                 },
-                                .counted_hash_map, .counted_hash_set => .{
-                                    .size = 0,
-                                    .index = 0,
-                                    .stack = try initStack(cursor, cursor.slot_ptr.slot.value + byteSizeOf(u64)),
+                                .counted_hash_map, .counted_hash_set => blk: {
+                                    const root_block_pos = std.math.add(u64, cursor.slot_ptr.slot.value, byteSizeOf(u64)) catch return error.EndOfStream;
+                                    break :blk .{
+                                        .size = 0,
+                                        .index = 0,
+                                        .stack = try initStack(cursor, root_block_pos),
+                                    };
                                 },
                                 else => return error.UnexpectedTag,
                             },
@@ -3765,133 +3779,163 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                         return @intCast(resolved_index);
                     }
 
-                    fn emptyIter(cursor: Cursor(write_mode)) !Iter {
-                        return .{ .cursor = cursor, .core = .{ .size = 0, .index = 0, .stack = try BoundedArray(Level, ITERATOR_STACK_SIZE).init(0) } };
+                    fn exhaustedIter(cursor: Cursor(write_mode), total_size: u64) !Iter {
+                        return .{ .cursor = cursor, .core = .{ .size = total_size, .index = total_size, .stack = try BoundedArray(Level, ITERATOR_STACK_SIZE).init(0) } };
                     }
 
                     pub fn initSortedFromIndex(unresolved_cursor: Cursor(write_mode), start_index: i65) !Iter {
                         const cursor = try unresolved_cursor.resolvedCursor();
                         switch (cursor.slot_ptr.slot.tag) {
                             // an unwritten map is .none (like iterator()): yield nothing
-                            .none => return emptyIter(cursor),
+                            .none => return exhaustedIter(cursor, 0),
                             .sorted_map, .sorted_set => {},
                             else => return error.UnexpectedTag,
                         }
-                        const total = try cursor.count();
-                        const idx = resolveStartIndex(start_index, total) orelse return emptyIter(cursor);
-                        const root_ptr = try sortedRootPtr(cursor);
+                        const header = try sortedHeader(cursor);
+                        const idx = resolveStartIndex(start_index, header.size) orelse return exhaustedIter(cursor, header.size);
                         return .{
                             .cursor = cursor,
-                            .core = .{ .size = total, .index = idx, .stack = try sortedStackFromIndex(cursor, root_ptr, idx) },
+                            .core = .{ .size = header.size, .index = idx, .stack = try sortedStackFromIndex(cursor, header.root_ptr, idx, header.size) },
                         };
                     }
 
                     pub fn initSortedFromKey(unresolved_cursor: Cursor(write_mode), start_key: []const u8) !Iter {
                         const cursor = try unresolved_cursor.resolvedCursor();
                         switch (cursor.slot_ptr.slot.tag) {
-                            .none => return emptyIter(cursor),
+                            .none => return exhaustedIter(cursor, 0),
                             .sorted_map, .sorted_set => {},
                             else => return error.UnexpectedTag,
                         }
-                        const total = try cursor.count();
-                        const root_ptr = try sortedRootPtr(cursor);
-                        const built = try sortedStackFromKey(cursor, root_ptr, start_key);
+                        const header = try sortedHeader(cursor);
+                        if (header.size == 0) return exhaustedIter(cursor, 0);
+                        const built = try sortedStackFromKey(cursor, header.root_ptr, start_key, header.size);
                         return .{
                             .cursor = cursor,
-                            .core = .{ .size = total, .index = built.before, .stack = built.stack },
+                            .core = .{ .size = header.size, .index = built.before, .stack = built.stack },
                         };
                     }
 
                     pub fn initArrayListFromIndex(unresolved_cursor: Cursor(write_mode), start_index: i65) !Iter {
                         const cursor = try unresolved_cursor.resolvedCursor();
                         switch (cursor.slot_ptr.slot.tag) {
-                            .none => return emptyIter(cursor),
+                            .none => return exhaustedIter(cursor, 0),
                             .array_list => {},
                             else => return error.UnexpectedTag,
                         }
                         var core_reader = cursor.db.core.reader();
                         try core_reader.seekTo(cursor.slot_ptr.slot.value);
                         const header: ArrayListHeader = @bitCast(try takeInt(&core_reader.interface, ArrayListHeaderInt, .big));
-                        const idx = resolveStartIndex(start_index, header.size) orelse return emptyIter(cursor);
-                        const last_key = header.size - 1;
-                        const shift: u6 = @intCast(if (last_key < SLOT_COUNT) 0 else std.math.log(u64, SLOT_COUNT, last_key));
+                        const idx = resolveStartIndex(start_index, header.size) orelse return exhaustedIter(cursor, header.size);
                         return .{
                             .cursor = cursor,
-                            .core = .{ .size = header.size, .index = idx, .stack = try arrayListStackFromIndex(cursor, header.ptr, idx, shift) },
+                            .core = .{ .size = header.size, .index = idx, .stack = try arrayListStackFromIndex(cursor, header, idx) },
                         };
                     }
 
                     pub fn initLinkedArrayListFromIndex(unresolved_cursor: Cursor(write_mode), start_index: i65) !Iter {
                         const cursor = try unresolved_cursor.resolvedCursor();
                         switch (cursor.slot_ptr.slot.tag) {
-                            .none => return emptyIter(cursor),
+                            .none => return exhaustedIter(cursor, 0),
                             .linked_array_list => {},
                             else => return error.UnexpectedTag,
                         }
                         var core_reader = cursor.db.core.reader();
                         try core_reader.seekTo(cursor.slot_ptr.slot.value);
                         const header: BTreeHeader = @bitCast(try takeInt(&core_reader.interface, BTreeHeaderInt, .big));
-                        const idx = resolveStartIndex(start_index, header.size) orelse return emptyIter(cursor);
+                        const idx = resolveStartIndex(start_index, header.size) orelse return exhaustedIter(cursor, header.size);
                         return .{
                             .cursor = cursor,
-                            .core = .{ .size = header.size, .index = idx, .stack = try btreeStackFromIndex(cursor, header.root_ptr, idx) },
+                            .core = .{ .size = header.size, .index = idx, .stack = try btreeStackFromIndex(cursor, header.root_ptr, idx, header.size) },
                         };
                     }
 
-                    fn sortedRootPtr(cursor: Cursor(write_mode)) !u64 {
-                        switch (cursor.slot_ptr.slot.tag) {
-                            .sorted_map, .sorted_set => {},
-                            else => return error.UnexpectedTag,
-                        }
+                    fn sortedHeader(cursor: Cursor(write_mode)) !BTreeHeader {
+                        std.debug.assert(cursor.slot_ptr.slot.tag == .sorted_map or cursor.slot_ptr.slot.tag == .sorted_set);
                         var core_reader = cursor.db.core.reader();
                         try core_reader.seekTo(cursor.slot_ptr.slot.value);
-                        const header: BTreeHeader = @bitCast(try takeInt(&core_reader.interface, BTreeHeaderInt, .big));
-                        return header.root_ptr;
+                        return @bitCast(try takeInt(&core_reader.interface, BTreeHeaderInt, .big));
                     }
 
-                    fn sortedStackFromIndex(cursor: Cursor(write_mode), root_ptr: u64, start_index: u64) !BoundedArray(Level, ITERATOR_STACK_SIZE) {
+                    fn sortedStackFromIndex(cursor: Cursor(write_mode), root_ptr: u64, start_index: u64, expected_size: u64) !BoundedArray(Level, ITERATOR_STACK_SIZE) {
                         var stack = try BoundedArray(Level, ITERATOR_STACK_SIZE).init(0);
                         var node_ptr = root_ptr;
+                        var expected = expected_size;
                         var rem = start_index;
                         while (true) {
                             const node = try cursor.db.readSortedNode(node_ptr);
-                            const position = node_ptr + BTREE_NODE_HEADER_SIZE;
+                            const position = std.math.add(u64, node_ptr, BTREE_NODE_HEADER_SIZE) catch return error.EndOfStream;
                             switch (node.kind) {
                                 .leaf => {
-                                    if (rem >= node.num) return error.InvalidBTreeNode;
-                                    try stack.append(.{ .position = position, .block = node.entries, .index = @intCast(rem) });
+                                    if (node.num != expected or rem >= node.num) return error.InvalidBTreeNode;
+                                    stack.append(.{
+                                        .position = position,
+                                        .block = node.entries,
+                                        .index = @intCast(rem),
+                                        .count = node.num,
+                                        .kind = .btree_leaf,
+                                    }) catch return error.InvalidBTreeNode;
+                                    assignBTreeHeights(&stack);
                                     return stack;
                                 },
                                 .branch => {
+                                    if (node.subtreeCount() != expected) return error.InvalidBTreeNode;
                                     var i: u8 = 0;
                                     while (i + 1 < node.num and rem >= node.counts[i]) : (i += 1) {
                                         rem -= node.counts[i];
                                     }
-                                    try stack.append(.{ .position = position, .block = node.children, .index = i });
+                                    if (rem >= node.counts[i]) return error.InvalidBTreeNode;
+                                    expected = node.counts[i];
+                                    stack.append(.{
+                                        .position = position,
+                                        .block = node.children,
+                                        .index = i,
+                                        .count = node.num,
+                                        .kind = .btree_branch,
+                                    }) catch return error.InvalidBTreeNode;
                                     node_ptr = node.children[i].value;
                                 },
                             }
                         }
                     }
 
-                    fn sortedStackFromKey(cursor: Cursor(write_mode), root_ptr: u64, key: []const u8) !struct { stack: BoundedArray(Level, ITERATOR_STACK_SIZE), before: u64 } {
+                    fn sortedStackFromKey(cursor: Cursor(write_mode), root_ptr: u64, key: []const u8, expected_size: u64) !struct { stack: BoundedArray(Level, ITERATOR_STACK_SIZE), before: u64 } {
                         var stack = try BoundedArray(Level, ITERATOR_STACK_SIZE).init(0);
                         var node_ptr = root_ptr;
+                        var expected = expected_size;
                         var before: u64 = 0;
                         while (true) {
                             const node = try cursor.db.readSortedNode(node_ptr);
-                            const position = node_ptr + BTREE_NODE_HEADER_SIZE;
+                            const position = std.math.add(u64, node_ptr, BTREE_NODE_HEADER_SIZE) catch return error.EndOfStream;
                             switch (node.kind) {
                                 .leaf => {
+                                    if (node.num != expected) return error.InvalidBTreeNode;
                                     const search = try cursor.db.sortedLeafSearch(&node, key);
-                                    before += search.index;
-                                    try stack.append(.{ .position = position, .block = node.entries, .index = search.index });
+                                    before = std.math.add(u64, before, search.index) catch return error.InvalidBTreeNode;
+                                    if (before > expected_size) return error.InvalidBTreeNode;
+                                    stack.append(.{
+                                        .position = position,
+                                        .block = node.entries,
+                                        .index = search.index,
+                                        .count = node.num,
+                                        .kind = .btree_leaf,
+                                    }) catch return error.InvalidBTreeNode;
+                                    assignBTreeHeights(&stack);
                                     return .{ .stack = stack, .before = before };
                                 },
                                 .branch => {
+                                    if (node.subtreeCount() != expected) return error.InvalidBTreeNode;
                                     const i = try cursor.db.sortedBranchSearch(&node, key);
-                                    for (node.counts[0..i]) |c| before += c;
-                                    try stack.append(.{ .position = position, .block = node.children, .index = i });
+                                    for (node.counts[0..i]) |c| {
+                                        before = std.math.add(u64, before, c) catch return error.InvalidBTreeNode;
+                                    }
+                                    expected = node.counts[i];
+                                    stack.append(.{
+                                        .position = position,
+                                        .block = node.children,
+                                        .index = i,
+                                        .count = node.num,
+                                        .kind = .btree_branch,
+                                    }) catch return error.InvalidBTreeNode;
                                     node_ptr = node.children[i].value;
                                 },
                             }
@@ -3901,17 +3945,68 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     // descend the array-list radix trie to `start_index`, pushing one
                     // Level per tier with its index set to that tier's child slot.
                     // nextInternal then walks forward from there.
-                    fn arrayListStackFromIndex(cursor: Cursor(write_mode), root_ptr: u64, start_index: u64, shift: u6) !BoundedArray(Level, ITERATOR_STACK_SIZE) {
+                    fn arrayListStackFromIndex(cursor: Cursor(write_mode), header: ArrayListHeader, start_index: u64) !BoundedArray(Level, ITERATOR_STACK_SIZE) {
                         var stack = try BoundedArray(Level, ITERATOR_STACK_SIZE).init(0);
-                        var pos = root_ptr;
-                        var sh = shift;
+                        const last_key = header.size - 1;
+                        const shift: u6 = @intCast(if (last_key < SLOT_COUNT) 0 else std.math.log(u64, SLOT_COUNT, last_key));
+                        const root_block = try readSlotBlock(cursor, header.ptr);
+                        if (shift == 0) {
+                            for (root_block[0..header.size]) |root_slot| {
+                                if (root_slot.tag == .index or root_slot.empty()) return error.UnexpectedTag;
+                            }
+                            try stack.append(.{
+                                .position = header.ptr,
+                                .block = root_block,
+                                .index = @intCast(start_index),
+                                .count = @intCast(header.size),
+                                .shift = 0,
+                                .kind = .array_leaf,
+                            });
+                            return stack;
+                        }
+
+                        const active_root_slots: u8 = @intCast((last_key >> (shift * BIT_COUNT)) + 1);
+                        for (root_block[0..active_root_slots]) |root_slot| {
+                            if (root_slot.tag != .index) return error.UnexpectedTag;
+                        }
+                        const root_i: u8 = @intCast(start_index >> (shift * BIT_COUNT) & MASK);
+                        try stack.append(.{
+                            .position = header.ptr,
+                            .block = root_block,
+                            .index = root_i,
+                            .count = active_root_slots,
+                            .shift = shift,
+                            .kind = .array_branch,
+                        });
+
+                        var pos = root_block[root_i].value;
+                        var sh: u6 = shift - 1;
                         while (true) {
                             const block = try readSlotBlock(cursor, pos);
                             const i: u8 = @intCast(start_index >> (sh * BIT_COUNT) & MASK);
-                            try stack.append(.{ .position = pos, .block = block, .index = i });
-                            if (sh == 0) return stack;
+                            if (sh == 0) {
+                                if (block[i].tag == .index or block[i].empty()) return error.UnexpectedTag;
+                                try stack.append(.{
+                                    .position = pos,
+                                    .block = block,
+                                    .index = i,
+                                    .count = SLOT_COUNT,
+                                    .shift = 0,
+                                    .kind = .array_leaf,
+                                });
+                                return stack;
+                            }
                             // every tier above the leaf is a populated .index slot for
                             // any start_index < size, so this child always exists
+                            if (block[i].tag != .index) return error.UnexpectedTag;
+                            try stack.append(.{
+                                .position = pos,
+                                .block = block,
+                                .index = i,
+                                .count = SLOT_COUNT,
+                                .shift = sh,
+                                .kind = .array_branch,
+                            });
                             pos = block[i].value;
                             sh -= 1;
                         }
@@ -3919,25 +4014,42 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
 
                     // descend the linked-array-list count b-tree to `start_index`; the
                     // positional analog of sortedStackFromIndex (no separator keys).
-                    fn btreeStackFromIndex(cursor: Cursor(write_mode), root_ptr: u64, start_index: u64) !BoundedArray(Level, ITERATOR_STACK_SIZE) {
+                    fn btreeStackFromIndex(cursor: Cursor(write_mode), root_ptr: u64, start_index: u64, expected_size: u64) !BoundedArray(Level, ITERATOR_STACK_SIZE) {
                         var stack = try BoundedArray(Level, ITERATOR_STACK_SIZE).init(0);
                         var node_ptr = root_ptr;
+                        var expected = expected_size;
                         var rem = start_index;
                         while (true) {
                             const node = try cursor.db.readBTreeNode(node_ptr);
-                            const position = node_ptr + BTREE_NODE_HEADER_SIZE;
+                            const position = std.math.add(u64, node_ptr, BTREE_NODE_HEADER_SIZE) catch return error.EndOfStream;
                             switch (node.kind) {
                                 .leaf => {
-                                    if (rem >= node.num) return error.InvalidBTreeNode;
-                                    try stack.append(.{ .position = position, .block = node.values, .index = @intCast(rem) });
+                                    if (node.num != expected or rem >= node.num) return error.InvalidBTreeNode;
+                                    stack.append(.{
+                                        .position = position,
+                                        .block = node.values,
+                                        .index = @intCast(rem),
+                                        .count = node.num,
+                                        .kind = .btree_leaf,
+                                    }) catch return error.InvalidBTreeNode;
+                                    assignBTreeHeights(&stack);
                                     return stack;
                                 },
                                 .branch => {
+                                    if (node.subtreeCount() != expected) return error.InvalidBTreeNode;
                                     var i: u8 = 0;
                                     while (i + 1 < node.num and rem >= node.counts[i]) : (i += 1) {
                                         rem -= node.counts[i];
                                     }
-                                    try stack.append(.{ .position = position, .block = node.children, .index = i });
+                                    if (rem >= node.counts[i]) return error.InvalidBTreeNode;
+                                    expected = node.counts[i];
+                                    stack.append(.{
+                                        .position = position,
+                                        .block = node.children,
+                                        .index = i,
+                                        .count = node.num,
+                                        .kind = .btree_branch,
+                                    }) catch return error.InvalidBTreeNode;
                                     node_ptr = node.children[i].value;
                                 },
                             }
@@ -3949,19 +4061,16 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     pub fn next(self: *Iter) !?Cursor(.read_only) {
                         switch (self.cursor.slot_ptr.slot.tag) {
                             .none => return null,
-                            .array_list => {
+                            .array_list, .linked_array_list, .sorted_map, .sorted_set => {
                                 if (self.core.index == self.core.size) return null;
+                                const item = try self.nextInternal();
+                                if (item == null) {
+                                    return if (self.cursor.slot_ptr.slot.tag == .array_list) error.UnexpectedTag else error.InvalidBTreeNode;
+                                }
                                 self.core.index += 1;
-                                return try self.nextInternal(0);
+                                return item;
                             },
-                            .linked_array_list, .sorted_map, .sorted_set => {
-                                if (self.core.index == self.core.size) return null;
-                                self.core.index += 1;
-                                // b-tree nodes have a kind+num header before their slots,
-                                // so child pointers are offset by BTREE_NODE_HEADER_SIZE
-                                return try self.nextInternal(BTREE_NODE_HEADER_SIZE);
-                            },
-                            .hash_map, .hash_set, .counted_hash_map, .counted_hash_set => return try self.nextInternal(0),
+                            .hash_map, .hash_set, .counted_hash_map, .counted_hash_set => return try self.nextInternal(),
                             else => return error.UnexpectedTag,
                         }
                     }
@@ -3969,6 +4078,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     // read a 16-slot index block (the iterable structures all use
                     // 9-byte slots in their index/node blocks)
                     fn readSlotBlock(cursor: Cursor(write_mode), position: u64) ![SLOT_COUNT]Slot {
+                        _ = std.math.add(u64, position, INDEX_BLOCK_SIZE) catch return error.EndOfStream;
                         var core_reader = cursor.db.core.reader();
                         try core_reader.seekTo(position);
                         var index_block_bytes: [INDEX_BLOCK_SIZE]u8 = @splat(0);
@@ -3982,6 +4092,49 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                         return index_block;
                     }
 
+                    const BTreeIterLevel = struct {
+                        level: Level,
+                        subtree_count: u64,
+                        first_child_count: u64,
+                    };
+
+                    fn readBTreeIterLevel(cursor: Cursor(write_mode), node_ptr: u64, allow_empty_leaf: bool) !BTreeIterLevel {
+                        const position = std.math.add(u64, node_ptr, BTREE_NODE_HEADER_SIZE) catch return error.EndOfStream;
+                        switch (cursor.slot_ptr.slot.tag) {
+                            .linked_array_list => {
+                                const node = try cursor.db.readBTreeNode(node_ptr);
+                                if (node.kind == .leaf and node.num == 0 and !allow_empty_leaf) return error.InvalidBTreeNode;
+                                return .{
+                                    .level = .{
+                                        .position = position,
+                                        .block = if (node.kind == .leaf) node.values else node.children,
+                                        .index = 0,
+                                        .count = node.num,
+                                        .kind = if (node.kind == .leaf) .btree_leaf else .btree_branch,
+                                    },
+                                    .subtree_count = node.subtreeCount(),
+                                    .first_child_count = if (node.kind == .branch) node.counts[0] else 0,
+                                };
+                            },
+                            .sorted_map, .sorted_set => {
+                                const node = try cursor.db.readSortedNode(node_ptr);
+                                if (node.kind == .leaf and node.num == 0 and !allow_empty_leaf) return error.InvalidBTreeNode;
+                                return .{
+                                    .level = .{
+                                        .position = position,
+                                        .block = if (node.kind == .leaf) node.entries else node.children,
+                                        .index = 0,
+                                        .count = node.num,
+                                        .kind = if (node.kind == .leaf) .btree_leaf else .btree_branch,
+                                    },
+                                    .subtree_count = node.subtreeCount(),
+                                    .first_child_count = if (node.kind == .branch) node.counts[0] else 0,
+                                };
+                            },
+                            else => return error.UnexpectedTag,
+                        }
+                    }
+
                     fn initStack(cursor: Cursor(write_mode), position: u64) !BoundedArray(Level, ITERATOR_STACK_SIZE) {
                         var stack = try BoundedArray(Level, ITERATOR_STACK_SIZE).init(0);
                         try stack.append(.{
@@ -3992,42 +4145,104 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                         return stack;
                     }
 
-                    fn nextInternal(self: *Iter, comptime node_offset: u64) !?Cursor(.read_only) {
+                    fn assignBTreeHeights(stack: *BoundedArray(Level, ITERATOR_STACK_SIZE)) void {
+                        const levels = stack.slice();
+                        const depth = levels.len;
+                        for (levels, 0..) |*lvl, d| {
+                            lvl.shift = @intCast(depth - 1 - d);
+                        }
+                    }
+
+                    fn initBTreeStack(cursor: Cursor(write_mode), header: BTreeHeader) !BoundedArray(Level, ITERATOR_STACK_SIZE) {
+                        var stack = try BoundedArray(Level, ITERATOR_STACK_SIZE).init(0);
+                        if (header.size == 0) return stack;
+                        const allow_empty_leaf = cursor.slot_ptr.slot.tag != .linked_array_list;
+                        var node_ptr = header.root_ptr;
+                        var expected = header.size;
+                        while (true) {
+                            const info = try readBTreeIterLevel(cursor, node_ptr, allow_empty_leaf);
+                            if (info.subtree_count != expected) return error.InvalidBTreeNode;
+                            stack.append(info.level) catch return error.InvalidBTreeNode;
+                            if (info.level.kind == .btree_leaf) {
+                                assignBTreeHeights(&stack);
+                                return stack;
+                            }
+                            expected = info.first_child_count;
+                            node_ptr = info.level.block[0].value;
+                        }
+                    }
+
+                    fn initArrayListStack(cursor: Cursor(write_mode), header: ArrayListHeader) !BoundedArray(Level, ITERATOR_STACK_SIZE) {
+                        if (header.size == 0) return try BoundedArray(Level, ITERATOR_STACK_SIZE).init(0);
+                        return try arrayListStackFromIndex(cursor, header, 0);
+                    }
+
+                    fn nextInternal(self: *Iter) !?Cursor(.read_only) {
                         while (self.core.stack.slice().len > 0) {
-                            const level = self.core.stack.slice()[self.core.stack.slice().len - 1];
-                            if (level.index == level.block.len) {
+                            const level = &self.core.stack.slice()[self.core.stack.slice().len - 1];
+                            if (level.index >= level.count) {
                                 _ = self.core.stack.pop();
                                 if (self.core.stack.slice().len > 0) {
                                     self.core.stack.slice()[self.core.stack.slice().len - 1].index += 1;
                                 }
                                 continue;
-                            } else {
-                                const next_slot = level.block[level.index];
-                                if (next_slot.tag == .index) {
-                                    // node_offset skips a b-tree node's kind+num header
-                                    const next_pos = next_slot.value + node_offset;
-                                    try self.core.stack.append(.{
-                                        .position = next_pos,
-                                        .block = try readSlotBlock(self.cursor, next_pos),
-                                        .index = 0,
-                                    });
+                            }
+
+                            const next_slot = level.block[level.index];
+                            switch (level.kind) {
+                                .btree_branch => {
+                                    if (next_slot.tag != .index or level.shift == 0) return error.InvalidBTreeNode;
+                                    const next_shift = level.shift - 1;
+                                    const expected_kind: LevelKind = if (next_shift == 0) .btree_leaf else .btree_branch;
+                                    const info = try readBTreeIterLevel(
+                                        self.cursor,
+                                        next_slot.value,
+                                        self.cursor.slot_ptr.slot.tag != .linked_array_list,
+                                    );
+                                    if (info.level.kind != expected_kind) return error.InvalidBTreeNode;
+                                    var child_level = info.level;
+                                    child_level.shift = next_shift;
+                                    self.core.stack.append(child_level) catch return error.InvalidBTreeNode;
                                     continue;
-                                } else {
-                                    self.core.stack.slice()[self.core.stack.slice().len - 1].index += 1;
-                                    // normally a slot that is .none should be skipped because it doesn't
-                                    // have a value, but if it's set to full, then it is actually a valid
-                                    // item that should be returned.
-                                    if (!next_slot.empty()) {
-                                        const position = level.position + (level.index * byteSizeOf(Slot));
-                                        return .{
-                                            .slot_ptr = .{ .position = position, .slot = next_slot },
-                                            .db = self.cursor.db,
-                                            .frozen_at = self.cursor.frozen_at,
-                                        };
-                                    } else {
-                                        continue;
-                                    }
-                                }
+                                },
+                                .array_branch => {
+                                    if (next_slot.tag != .index or level.shift == 0) return error.UnexpectedTag;
+                                    const next_shift = level.shift - 1;
+                                    self.core.stack.append(.{
+                                        .position = next_slot.value,
+                                        .block = try readSlotBlock(self.cursor, next_slot.value),
+                                        .index = 0,
+                                        .count = SLOT_COUNT,
+                                        .shift = next_shift,
+                                        .kind = if (next_shift == 0) .array_leaf else .array_branch,
+                                    }) catch return error.UnexpectedTag;
+                                    continue;
+                                },
+                                .btree_leaf => if (next_slot.tag == .index or next_slot.empty()) return error.InvalidBTreeNode,
+                                .array_leaf => if (next_slot.tag == .index or next_slot.empty()) return error.UnexpectedTag,
+                                .any => if (next_slot.tag == .index) {
+                                    if (self.core.stack.slice().len >= (HASH_SIZE * 8) / BIT_COUNT) return error.KeyOffsetExceeded;
+                                    self.core.stack.append(.{
+                                        .position = next_slot.value,
+                                        .block = try readSlotBlock(self.cursor, next_slot.value),
+                                        .index = 0,
+                                    }) catch return error.KeyOffsetExceeded;
+                                    continue;
+                                },
+                            }
+
+                            const slot_index = level.index;
+                            level.index = slot_index + 1;
+                            // normally a slot that is .none should be skipped because it doesn't
+                            // have a value, but if it's set to full, then it is actually a valid
+                            // item that should be returned.
+                            if (!next_slot.empty()) {
+                                const position = level.position + (slot_index * byteSizeOf(Slot));
+                                return .{
+                                    .slot_ptr = .{ .position = position, .slot = next_slot },
+                                    .db = self.cursor.db,
+                                    .frozen_at = self.cursor.frozen_at,
+                                };
                             }
                         }
                         return null;
