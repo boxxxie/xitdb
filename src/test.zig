@@ -4366,3 +4366,839 @@ fn testRoots(
         try std.testing.expectEqual(size, try db.committedSize());
     }
 }
+
+const IterIntoFixture = struct {
+    const DB = xitdb.Database(.memory, HashInt);
+    const Iter = DB.CursorIter;
+    const N: usize = 40;
+    const H: usize = 20;
+
+    allocator: std.mem.Allocator,
+    buffer: std.Io.Writer.Allocating,
+    db: DB,
+    it: *Iter,
+
+    unwritten_rc: DB.Cursor(.read_only),
+    scalar_rc: DB.Cursor(.read_only),
+    empty_cols: [8]DB.Cursor(.read_only),
+
+    al_rc: DB.Cursor(.read_only),
+    ll_rc: DB.Cursor(.read_only),
+    sm_rc: DB.Cursor(.read_only),
+    ss_rc: DB.Cursor(.read_only),
+    hm_rc: DB.Cursor(.read_only),
+    chm_rc: DB.Cursor(.read_only),
+    hs_rc: DB.Cursor(.read_only),
+    chs_rc: DB.Cursor(.read_only),
+
+    al_ro: DB.ArrayList(.read_only),
+    ll_ro: DB.LinkedArrayList(.read_only),
+    sm_ro: DB.SortedMap(.read_only),
+    ss_ro: DB.SortedSet(.read_only),
+    hm_ro: DB.HashMap(.read_only),
+    chm_ro: DB.CountedHashMap(.read_only),
+    hs_ro: DB.HashSet(.read_only),
+    chs_ro: DB.CountedHashSet(.read_only),
+
+    // Must initialize in place so `&self.buffer` stored inside `self.db` stays valid.
+    fn init(self: *IterIntoFixture, allocator: std.mem.Allocator) !void {
+        self.allocator = allocator;
+        self.buffer = std.Io.Writer.Allocating.init(allocator);
+        errdefer self.buffer.deinit();
+
+        self.db = try DB.init(std.testing.io, .{ .buffer = &self.buffer, .max_size = 500_000 });
+        self.it = try allocator.create(Iter);
+        errdefer allocator.destroy(self.it);
+
+        const SetupCtx = struct {
+            pub fn run(_: @This(), cursor: *DB.Cursor(.read_write)) !void {
+                const root_map = try DB.HashMap(.read_write).init(cursor.*);
+                const none_list = try DB.ArrayList(.read_write).init(try root_map.putCursor(hashInt("none_list")));
+                _ = try none_list.appendCursor();
+                var scalar_cur = try root_map.putCursor(hashInt("scalar"));
+                try scalar_cur.write(.{ .uint = 42 });
+
+                _ = try DB.ArrayList(.read_write).init(try root_map.putCursor(hashInt("empty_al")));
+                _ = try DB.LinkedArrayList(.read_write).init(try root_map.putCursor(hashInt("empty_ll")));
+                _ = try DB.SortedMap(.read_write).init(try root_map.putCursor(hashInt("empty_sm")));
+                _ = try DB.SortedSet(.read_write).init(try root_map.putCursor(hashInt("empty_ss")));
+                _ = try DB.HashMap(.read_write).init(try root_map.putCursor(hashInt("empty_hm")));
+                _ = try DB.CountedHashMap(.read_write).init(try root_map.putCursor(hashInt("empty_chm")));
+                _ = try DB.HashSet(.read_write).init(try root_map.putCursor(hashInt("empty_hs")));
+                _ = try DB.CountedHashSet(.read_write).init(try root_map.putCursor(hashInt("empty_chs")));
+
+                const al = try DB.ArrayList(.read_write).init(try root_map.putCursor(hashInt("al")));
+                const ll = try DB.LinkedArrayList(.read_write).init(try root_map.putCursor(hashInt("ll")));
+                const sm = try DB.SortedMap(.read_write).init(try root_map.putCursor(hashInt("sm")));
+                const ss = try DB.SortedSet(.read_write).init(try root_map.putCursor(hashInt("ss")));
+                for (0..N) |i| {
+                    var buf: [16]u8 = undefined;
+                    try al.append(.{ .bytes = try std.fmt.bufPrint(&buf, "al-{d:0>2}", .{i}) });
+                    try ll.append(.{ .bytes = try std.fmt.bufPrint(&buf, "ll-{d:0>2}", .{i}) });
+                    try sm.put(try std.fmt.bufPrint(&buf, "k-{d:0>2}", .{i}), .{ .uint = i });
+                    try ss.put(try std.fmt.bufPrint(&buf, "s-{d:0>2}", .{i}));
+                }
+
+                const hm = try DB.HashMap(.read_write).init(try root_map.putCursor(hashInt("hm")));
+                const chm = try DB.CountedHashMap(.read_write).init(try root_map.putCursor(hashInt("chm")));
+                const hs = try DB.HashSet(.read_write).init(try root_map.putCursor(hashInt("hs")));
+                const chs = try DB.CountedHashSet(.read_write).init(try root_map.putCursor(hashInt("chs")));
+                for (0..H) |i| {
+                    var mk_buf: [16]u8 = undefined;
+                    const mk = try std.fmt.bufPrint(&mk_buf, "m-{d:0>2}", .{i});
+                    try hm.putKey(hashInt(mk), .{ .bytes = mk });
+                    try hm.put(hashInt(mk), .{ .uint = i });
+                    try chm.putKey(hashInt(mk), .{ .bytes = mk });
+                    try chm.put(hashInt(mk), .{ .uint = i });
+
+                    var hk_buf: [16]u8 = undefined;
+                    const hk = try std.fmt.bufPrint(&hk_buf, "h-{d:0>2}", .{i});
+                    try hs.put(hashInt(hk), .{ .bytes = hk });
+                    try chs.put(hashInt(hk), .{ .bytes = hk });
+                }
+            }
+        };
+        try self.db.runContext(SetupCtx{});
+
+        const root_ro = try DB.HashMap(.read_only).init(self.db.rootCursor().readOnly());
+        const none_list_ro = try DB.ArrayList(.read_only).init((try root_ro.getCursor(hashInt("none_list"))).?);
+        self.unwritten_rc = (try none_list_ro.getCursor(0)).?;
+        self.scalar_rc = (try root_ro.getCursor(hashInt("scalar"))).?;
+
+        self.empty_cols = .{
+            (try root_ro.getCursor(hashInt("empty_al"))).?,
+            (try root_ro.getCursor(hashInt("empty_ll"))).?,
+            (try root_ro.getCursor(hashInt("empty_sm"))).?,
+            (try root_ro.getCursor(hashInt("empty_ss"))).?,
+            (try root_ro.getCursor(hashInt("empty_hm"))).?,
+            (try root_ro.getCursor(hashInt("empty_chm"))).?,
+            (try root_ro.getCursor(hashInt("empty_hs"))).?,
+            (try root_ro.getCursor(hashInt("empty_chs"))).?,
+        };
+
+        self.al_rc = (try root_ro.getCursor(hashInt("al"))).?;
+        self.ll_rc = (try root_ro.getCursor(hashInt("ll"))).?;
+        self.sm_rc = (try root_ro.getCursor(hashInt("sm"))).?;
+        self.ss_rc = (try root_ro.getCursor(hashInt("ss"))).?;
+        self.hm_rc = (try root_ro.getCursor(hashInt("hm"))).?;
+        self.chm_rc = (try root_ro.getCursor(hashInt("chm"))).?;
+        self.hs_rc = (try root_ro.getCursor(hashInt("hs"))).?;
+        self.chs_rc = (try root_ro.getCursor(hashInt("chs"))).?;
+
+        self.al_ro = try DB.ArrayList(.read_only).init(self.al_rc);
+        self.ll_ro = try DB.LinkedArrayList(.read_only).init(self.ll_rc);
+        self.sm_ro = try DB.SortedMap(.read_only).init(self.sm_rc);
+        self.ss_ro = try DB.SortedSet(.read_only).init(self.ss_rc);
+        self.hm_ro = try DB.HashMap(.read_only).init(self.hm_rc);
+        self.chm_ro = try DB.CountedHashMap(.read_only).init(self.chm_rc);
+        self.hs_ro = try DB.HashSet(.read_only).init(self.hs_rc);
+        self.chs_ro = try DB.CountedHashSet(.read_only).init(self.chs_rc);
+    }
+
+    fn deinit(self: *IterIntoFixture) void {
+        self.allocator.destroy(self.it);
+        self.buffer.deinit();
+    }
+
+    fn makeDirty(it: *Iter, sm_cursor: DB.Cursor(.read_only)) !void {
+        try it.initInto(sm_cursor);
+        for (0..20) |_| {
+            try std.testing.expect((try it.next()) != null);
+        }
+        try std.testing.expect(it.core.stack.len >= 2);
+        try std.testing.expectEqual(@as(u64, 20), it.core.index);
+        try std.testing.expectEqual(@as(u64, N), it.core.size);
+    }
+
+    fn freeStrings(alloc: std.mem.Allocator, list: *std.ArrayList([]u8)) void {
+        for (list.items) |s| alloc.free(s);
+        list.deinit(alloc);
+    }
+
+    fn collectStrings(alloc: std.mem.Allocator, it: *Iter, kv_key: bool) !std.ArrayList([]u8) {
+        var out: std.ArrayList([]u8) = .empty;
+        errdefer freeStrings(alloc, &out);
+        while (try it.next()) |c| {
+            const target = if (kv_key) (try c.readKeyValuePair()).key_cursor else c;
+            var buf: [64]u8 = undefined;
+            const s = try target.readBytes(&buf);
+            try out.append(alloc, try alloc.dupe(u8, s));
+        }
+        return out;
+    }
+
+    fn lessThanStr(_: void, lhs: []u8, rhs: []u8) bool {
+        return std.mem.order(u8, lhs, rhs) == .lt;
+    }
+
+    fn expectSliceEq(a: []const []u8, b: []const []u8) !void {
+        try std.testing.expectEqual(a.len, b.len);
+        for (a, b) |sa, sb| {
+            try std.testing.expectEqualStrings(sa, sb);
+        }
+    }
+
+    fn expectRolledBack(it: *Iter) !void {
+        try std.testing.expectEqual(@as(usize, 0), it.core.stack.len);
+        try std.testing.expectEqual(@as(u64, 0), it.core.size);
+        try std.testing.expectEqual(@as(u64, 0), it.core.index);
+        try std.testing.expect(it.cursor.slot_ptr.position == null);
+        try std.testing.expectEqual(xitdb.Tag.none, it.cursor.slot_ptr.slot.tag);
+        try std.testing.expect((try it.next()) == null);
+    }
+
+    fn expectUnwrittenEmpty(it: *Iter, expected_pos: ?u64) !void {
+        try std.testing.expectEqual(@as(usize, 0), it.core.stack.len);
+        try std.testing.expectEqual(@as(u64, 0), it.core.size);
+        try std.testing.expectEqual(@as(u64, 0), it.core.index);
+        try std.testing.expectEqual(expected_pos, it.cursor.slot_ptr.position);
+        try std.testing.expectEqual(xitdb.Tag.none, it.cursor.slot_ptr.slot.tag);
+        try std.testing.expect((try it.next()) == null);
+    }
+};
+
+test "in-place iterator initInto and collection wrappers across write modes" {
+    const F = IterIntoFixture;
+    const DB = F.DB;
+    const Iter = F.Iter;
+    const N = F.N;
+    const H = F.H;
+    const allocator = std.testing.allocator;
+
+    try std.testing.expectEqual(DB.CursorIter, DB.Cursor(.read_only).Iter);
+    try std.testing.expectEqual(DB.CursorIter, DB.Cursor(.read_write).Iter);
+
+    var fix: F = undefined;
+    try fix.init(allocator);
+    defer fix.deinit();
+    const it = fix.it;
+
+    const ColSpec = struct {
+        rc: DB.Cursor(.read_only),
+        kv_key: bool,
+        sorted: bool,
+        count: usize,
+        prefix: []const u8,
+    };
+    const all_cols = [_]ColSpec{
+        .{ .rc = fix.al_rc, .kv_key = false, .sorted = true, .count = N, .prefix = "al-" },
+        .{ .rc = fix.ll_rc, .kv_key = false, .sorted = true, .count = N, .prefix = "ll-" },
+        .{ .rc = fix.sm_rc, .kv_key = true, .sorted = true, .count = N, .prefix = "k-" },
+        .{ .rc = fix.ss_rc, .kv_key = true, .sorted = true, .count = N, .prefix = "s-" },
+        .{ .rc = fix.hm_rc, .kv_key = true, .sorted = false, .count = H, .prefix = "m-" },
+        .{ .rc = fix.chm_rc, .kv_key = true, .sorted = false, .count = H, .prefix = "m-" },
+        .{ .rc = fix.hs_rc, .kv_key = true, .sorted = false, .count = H, .prefix = "h-" },
+        .{ .rc = fix.chs_rc, .kv_key = true, .sorted = false, .count = H, .prefix = "h-" },
+    };
+
+    // initInto / iteratorInto across all 8 populated collections, read-only wrappers, empty collections, and .none
+    for (all_cols) |col| {
+        try F.makeDirty(it, fix.sm_rc);
+        try col.rc.iteratorInto(it);
+        var got = try F.collectStrings(allocator, it, col.kv_key);
+        defer F.freeStrings(allocator, &got);
+
+        var ref_it = try col.rc.iterator();
+        var ref = try F.collectStrings(allocator, &ref_it, col.kv_key);
+        defer F.freeStrings(allocator, &ref);
+
+        try std.testing.expectEqual(col.count, got.items.len);
+        try F.expectSliceEq(ref.items, got.items);
+        if (!col.sorted) std.sort.pdq([]u8, got.items, {}, F.lessThanStr);
+        for (got.items, 0..) |item, i| {
+            var ebuf: [16]u8 = undefined;
+            try std.testing.expectEqualStrings(try std.fmt.bufPrint(&ebuf, "{s}{d:0>2}", .{ col.prefix, i }), item);
+        }
+    }
+    {
+        try F.makeDirty(it, fix.sm_rc);
+        try fix.al_ro.iteratorInto(it);
+        try std.testing.expect((try it.next()) != null);
+        try F.makeDirty(it, fix.sm_rc);
+        try fix.ll_ro.iteratorInto(it);
+        try std.testing.expect((try it.next()) != null);
+        try F.makeDirty(it, fix.sm_rc);
+        try fix.sm_ro.iteratorInto(it);
+        try std.testing.expect((try it.next()) != null);
+        try F.makeDirty(it, fix.sm_rc);
+        try fix.ss_ro.iteratorInto(it);
+        try std.testing.expect((try it.next()) != null);
+        try F.makeDirty(it, fix.sm_rc);
+        try fix.hm_ro.iteratorInto(it);
+        try std.testing.expect((try it.next()) != null);
+        try F.makeDirty(it, fix.sm_rc);
+        try fix.chm_ro.iteratorInto(it);
+        try std.testing.expect((try it.next()) != null);
+        try F.makeDirty(it, fix.sm_rc);
+        try fix.hs_ro.iteratorInto(it);
+        try std.testing.expect((try it.next()) != null);
+        try F.makeDirty(it, fix.sm_rc);
+        try fix.chs_ro.iteratorInto(it);
+        try std.testing.expect((try it.next()) != null);
+    }
+    for (fix.empty_cols) |ec| {
+        try F.makeDirty(it, fix.sm_rc);
+        try it.initInto(ec);
+        try std.testing.expect((try it.next()) == null);
+    }
+    try F.makeDirty(it, fix.sm_rc);
+    try it.initInto(fix.unwritten_rc);
+    try F.expectUnwrittenEmpty(it, fix.unwritten_rc.slot_ptr.position);
+
+    // initSortedFromIndexInto / SortedMap.iteratorFromIndexInto / SortedSet.iteratorFromIndexInto
+    {
+        try F.makeDirty(it, fix.sm_rc);
+        try fix.sm_ro.iteratorFromIndexInto(it, 25);
+        var got = try F.collectStrings(allocator, it, true);
+        defer F.freeStrings(allocator, &got);
+        var ref_it = try fix.sm_ro.iteratorFromIndex(25);
+        var ref = try F.collectStrings(allocator, &ref_it, true);
+        defer F.freeStrings(allocator, &ref);
+        try F.expectSliceEq(ref.items, got.items);
+        try std.testing.expectEqual(@as(usize, 15), got.items.len);
+        try std.testing.expectEqualStrings("k-25", got.items[0]);
+        try std.testing.expectEqualStrings("k-39", got.items[14]);
+
+        try F.makeDirty(it, fix.sm_rc);
+        try it.initSortedFromIndexInto(fix.sm_rc, -5);
+        var neg = try F.collectStrings(allocator, it, true);
+        defer F.freeStrings(allocator, &neg);
+        try std.testing.expectEqual(@as(usize, 5), neg.items.len);
+        try std.testing.expectEqualStrings("k-35", neg.items[0]);
+        try std.testing.expectEqualStrings("k-39", neg.items[4]);
+
+        try F.makeDirty(it, fix.sm_rc);
+        try fix.ss_ro.iteratorFromIndexInto(it, 30);
+        var ss_got = try F.collectStrings(allocator, it, true);
+        defer F.freeStrings(allocator, &ss_got);
+        try std.testing.expectEqual(@as(usize, 10), ss_got.items.len);
+        try std.testing.expectEqualStrings("s-30", ss_got.items[0]);
+        try std.testing.expectEqualStrings("s-39", ss_got.items[9]);
+
+        for ([_]i65{ N, -@as(i65, N) - 1 }) |oob| {
+            try F.makeDirty(it, fix.sm_rc);
+            try it.initSortedFromIndexInto(fix.sm_rc, oob);
+            try std.testing.expectEqual(@as(u64, N), it.core.size);
+            try std.testing.expectEqual(@as(u64, N), it.core.index);
+            try std.testing.expectEqual(@as(usize, 0), it.core.stack.len);
+            try std.testing.expect((try it.next()) == null);
+        }
+        try F.makeDirty(it, fix.sm_rc);
+        try it.initSortedFromIndexInto(fix.empty_cols[2], 0);
+        try std.testing.expect((try it.next()) == null);
+        try F.makeDirty(it, fix.sm_rc);
+        try it.initSortedFromIndexInto(fix.unwritten_rc, 0);
+        try std.testing.expect((try it.next()) == null);
+    }
+
+    // initSortedFromKeyInto / SortedMap.iteratorFromInto / SortedSet.iteratorFromInto
+    {
+        try F.makeDirty(it, fix.sm_rc);
+        try fix.sm_ro.iteratorFromInto(it, "k-17");
+        var got = try F.collectStrings(allocator, it, true);
+        defer F.freeStrings(allocator, &got);
+        var ref_it = try fix.sm_ro.iteratorFrom("k-17");
+        var ref = try F.collectStrings(allocator, &ref_it, true);
+        defer F.freeStrings(allocator, &ref);
+        try F.expectSliceEq(ref.items, got.items);
+        try std.testing.expectEqual(@as(usize, 23), got.items.len);
+        try std.testing.expectEqualStrings("k-17", got.items[0]);
+
+        try F.makeDirty(it, fix.sm_rc);
+        try it.initSortedFromKeyInto(fix.sm_rc, "k-17a");
+        var mid = try F.collectStrings(allocator, it, true);
+        defer F.freeStrings(allocator, &mid);
+        try std.testing.expectEqual(@as(usize, 22), mid.items.len);
+        try std.testing.expectEqualStrings("k-18", mid.items[0]);
+
+        try F.makeDirty(it, fix.sm_rc);
+        try it.initSortedFromKeyInto(fix.sm_rc, "z-99");
+        try std.testing.expectEqual(@as(u64, N), it.core.size);
+        try std.testing.expectEqual(@as(u64, N), it.core.index);
+        try std.testing.expect((try it.next()) == null);
+
+        try F.makeDirty(it, fix.sm_rc);
+        try fix.ss_ro.iteratorFromInto(it, "s-35");
+        var ss_got = try F.collectStrings(allocator, it, true);
+        defer F.freeStrings(allocator, &ss_got);
+        try std.testing.expectEqual(@as(usize, 5), ss_got.items.len);
+        try std.testing.expectEqualStrings("s-35", ss_got.items[0]);
+        try std.testing.expectEqualStrings("s-39", ss_got.items[4]);
+
+        try F.makeDirty(it, fix.sm_rc);
+        try it.initSortedFromKeyInto(fix.empty_cols[2], "a");
+        try std.testing.expect((try it.next()) == null);
+        try F.makeDirty(it, fix.sm_rc);
+        try it.initSortedFromKeyInto(fix.unwritten_rc, "a");
+        try std.testing.expect((try it.next()) == null);
+    }
+
+    // initArrayListFromIndexInto / ArrayList.iteratorFromInto
+    {
+        try F.makeDirty(it, fix.sm_rc);
+        try fix.al_ro.iteratorFromInto(it, 20);
+        var got = try F.collectStrings(allocator, it, false);
+        defer F.freeStrings(allocator, &got);
+        var ref_it = try fix.al_ro.iteratorFrom(20);
+        var ref = try F.collectStrings(allocator, &ref_it, false);
+        defer F.freeStrings(allocator, &ref);
+        try F.expectSliceEq(ref.items, got.items);
+        try std.testing.expectEqual(@as(usize, 20), got.items.len);
+        try std.testing.expectEqualStrings("al-20", got.items[0]);
+        try std.testing.expectEqualStrings("al-39", got.items[19]);
+
+        try F.makeDirty(it, fix.sm_rc);
+        try it.initArrayListFromIndexInto(fix.al_rc, -3);
+        var neg = try F.collectStrings(allocator, it, false);
+        defer F.freeStrings(allocator, &neg);
+        try std.testing.expectEqual(@as(usize, 3), neg.items.len);
+        try std.testing.expectEqualStrings("al-37", neg.items[0]);
+        try std.testing.expectEqualStrings("al-39", neg.items[2]);
+
+        for ([_]i65{ N, -@as(i65, N) - 1 }) |oob| {
+            try F.makeDirty(it, fix.sm_rc);
+            try it.initArrayListFromIndexInto(fix.al_rc, oob);
+            try std.testing.expectEqual(@as(u64, N), it.core.size);
+            try std.testing.expectEqual(@as(u64, N), it.core.index);
+            try std.testing.expectEqual(@as(usize, 0), it.core.stack.len);
+            try std.testing.expect((try it.next()) == null);
+        }
+        try F.makeDirty(it, fix.sm_rc);
+        try it.initArrayListFromIndexInto(fix.empty_cols[0], 0);
+        try std.testing.expect((try it.next()) == null);
+        try F.makeDirty(it, fix.sm_rc);
+        try it.initArrayListFromIndexInto(fix.unwritten_rc, 0);
+        try std.testing.expect((try it.next()) == null);
+    }
+
+    // initLinkedArrayListFromIndexInto / LinkedArrayList.iteratorFromInto
+    {
+        try F.makeDirty(it, fix.sm_rc);
+        try fix.ll_ro.iteratorFromInto(it, 22);
+        var got = try F.collectStrings(allocator, it, false);
+        defer F.freeStrings(allocator, &got);
+        var ref_it = try fix.ll_ro.iteratorFrom(22);
+        var ref = try F.collectStrings(allocator, &ref_it, false);
+        defer F.freeStrings(allocator, &ref);
+        try F.expectSliceEq(ref.items, got.items);
+        try std.testing.expectEqual(@as(usize, 18), got.items.len);
+        try std.testing.expectEqualStrings("ll-22", got.items[0]);
+        try std.testing.expectEqualStrings("ll-39", got.items[17]);
+
+        try F.makeDirty(it, fix.sm_rc);
+        try it.initLinkedArrayListFromIndexInto(fix.ll_rc, -4);
+        var neg = try F.collectStrings(allocator, it, false);
+        defer F.freeStrings(allocator, &neg);
+        try std.testing.expectEqual(@as(usize, 4), neg.items.len);
+        try std.testing.expectEqualStrings("ll-36", neg.items[0]);
+        try std.testing.expectEqualStrings("ll-39", neg.items[3]);
+
+        for ([_]i65{ N, -@as(i65, N) - 1 }) |oob| {
+            try F.makeDirty(it, fix.sm_rc);
+            try it.initLinkedArrayListFromIndexInto(fix.ll_rc, oob);
+            try std.testing.expectEqual(@as(u64, N), it.core.size);
+            try std.testing.expectEqual(@as(u64, N), it.core.index);
+            try std.testing.expectEqual(@as(usize, 0), it.core.stack.len);
+            try std.testing.expect((try it.next()) == null);
+        }
+        try F.makeDirty(it, fix.sm_rc);
+        try it.initLinkedArrayListFromIndexInto(fix.empty_cols[1], 0);
+        try std.testing.expect((try it.next()) == null);
+        try F.makeDirty(it, fix.sm_rc);
+        try it.initLinkedArrayListFromIndexInto(fix.unwritten_rc, 0);
+        try std.testing.expect((try it.next()) == null);
+    }
+
+    // Verify unified Iter across .read_write and .read_only and exercise all .read_write *Into wrappers
+    try std.testing.expect(DB.Cursor(.read_write).Iter == DB.Cursor(.read_only).Iter);
+    const RwCheckCtx = struct {
+        alloc: std.mem.Allocator,
+        pub fn run(self: @This(), cursor: *DB.Cursor(.read_write)) !void {
+            const rw_it = try self.alloc.create(Iter);
+            defer self.alloc.destroy(rw_it);
+
+            const root_rw = try DB.HashMap(.read_write).init(cursor.*);
+            try cursor.iteratorInto(rw_it);
+            try std.testing.expect((try rw_it.next()) != null);
+            // Cross-mode reuse: same *Iter instance from .read_write traversal reused for .read_only cursor
+            const ro_sm_rc = (try root_rw.getCursor(hashInt("sm"))).?;
+            try ro_sm_rc.iteratorInto(rw_it);
+            try std.testing.expect((try rw_it.next()) != null);
+
+            try root_rw.iteratorInto(rw_it);
+            try std.testing.expect((try rw_it.next()) != null);
+
+            const hm_rw = try DB.HashMap(.read_write).init(try root_rw.putCursor(hashInt("hm")));
+            try hm_rw.iteratorInto(rw_it);
+            try std.testing.expect((try rw_it.next()) != null);
+
+            const chm_rw = try DB.CountedHashMap(.read_write).init(try root_rw.putCursor(hashInt("chm")));
+            try chm_rw.iteratorInto(rw_it);
+            try std.testing.expect((try rw_it.next()) != null);
+
+            const hs_rw = try DB.HashSet(.read_write).init(try root_rw.putCursor(hashInt("hs")));
+            try hs_rw.iteratorInto(rw_it);
+            try std.testing.expect((try rw_it.next()) != null);
+
+            const chs_rw = try DB.CountedHashSet(.read_write).init(try root_rw.putCursor(hashInt("chs")));
+            try chs_rw.iteratorInto(rw_it);
+            try std.testing.expect((try rw_it.next()) != null);
+
+            const al_rw = try DB.ArrayList(.read_write).init(try root_rw.putCursor(hashInt("al")));
+            try al_rw.iteratorInto(rw_it);
+            try std.testing.expect((try rw_it.next()) != null);
+            try al_rw.iteratorFromInto(rw_it, 10);
+            try std.testing.expect((try rw_it.next()) != null);
+
+            const ll_rw = try DB.LinkedArrayList(.read_write).init(try root_rw.putCursor(hashInt("ll")));
+            try ll_rw.iteratorInto(rw_it);
+            try std.testing.expect((try rw_it.next()) != null);
+            try ll_rw.iteratorFromInto(rw_it, 10);
+            try std.testing.expect((try rw_it.next()) != null);
+
+            const sm_rw = try DB.SortedMap(.read_write).init(try root_rw.putCursor(hashInt("sm")));
+            try sm_rw.iteratorInto(rw_it);
+            try std.testing.expect((try rw_it.next()) != null);
+            try sm_rw.iteratorFromInto(rw_it, "k-10");
+            try std.testing.expect((try rw_it.next()) != null);
+            try sm_rw.iteratorFromIndexInto(rw_it, 10);
+            try std.testing.expect((try rw_it.next()) != null);
+
+            const ss_rw = try DB.SortedSet(.read_write).init(try root_rw.putCursor(hashInt("ss")));
+            try ss_rw.iteratorInto(rw_it);
+            try std.testing.expect((try rw_it.next()) != null);
+            try ss_rw.iteratorFromInto(rw_it, "s-10");
+            try std.testing.expect((try rw_it.next()) != null);
+            try ss_rw.iteratorFromIndexInto(rw_it, 10);
+            try std.testing.expect((try rw_it.next()) != null);
+        }
+    };
+    try fix.db.runContext(RwCheckCtx{ .alloc = allocator });
+}
+
+test "in-place iterator self-aliasing restarts and error rollback" {
+    const F = IterIntoFixture;
+    const DB = F.DB;
+    const Iter = F.Iter;
+    const N = F.N;
+    const allocator = std.testing.allocator;
+
+    var fix: F = undefined;
+    try fix.init(allocator);
+    defer fix.deinit();
+    const it = fix.it;
+
+    // Self-aliasing restarts: it.init*Into(it.cursor) and it.cursor.iteratorInto(it)
+    {
+        try it.initInto(fix.sm_rc);
+        for (0..10) |_| try std.testing.expect((try it.next()) != null);
+        try it.initInto(it.cursor);
+        var s1 = try F.collectStrings(allocator, it, true);
+        defer F.freeStrings(allocator, &s1);
+        try std.testing.expectEqual(N, s1.items.len);
+        try std.testing.expectEqualStrings("k-00", s1.items[0]);
+
+        try it.initInto(fix.sm_rc);
+        for (0..10) |_| try std.testing.expect((try it.next()) != null);
+        try it.cursor.iteratorInto(it);
+        var s2 = try F.collectStrings(allocator, it, true);
+        defer F.freeStrings(allocator, &s2);
+        try std.testing.expectEqual(N, s2.items.len);
+        try std.testing.expectEqualStrings("k-00", s2.items[0]);
+
+        try it.initSortedFromIndexInto(it.cursor, 25);
+        var s3 = try F.collectStrings(allocator, it, true);
+        defer F.freeStrings(allocator, &s3);
+        try std.testing.expectEqual(@as(usize, 15), s3.items.len);
+        try std.testing.expectEqualStrings("k-25", s3.items[0]);
+
+        try it.initSortedFromKeyInto(it.cursor, "k-17");
+        var s4 = try F.collectStrings(allocator, it, true);
+        defer F.freeStrings(allocator, &s4);
+        try std.testing.expectEqual(@as(usize, 23), s4.items.len);
+        try std.testing.expectEqualStrings("k-17", s4.items[0]);
+
+        try it.initInto(fix.al_rc);
+        for (0..5) |_| try std.testing.expect((try it.next()) != null);
+        try it.initArrayListFromIndexInto(it.cursor, 20);
+        var s5 = try F.collectStrings(allocator, it, false);
+        defer F.freeStrings(allocator, &s5);
+        try std.testing.expectEqual(@as(usize, 20), s5.items.len);
+        try std.testing.expectEqualStrings("al-20", s5.items[0]);
+
+        try it.initInto(fix.ll_rc);
+        for (0..5) |_| try std.testing.expect((try it.next()) != null);
+        try it.initLinkedArrayListFromIndexInto(it.cursor, 22);
+        var s6 = try F.collectStrings(allocator, it, false);
+        defer F.freeStrings(allocator, &s6);
+        try std.testing.expectEqual(@as(usize, 18), s6.items.len);
+        try std.testing.expectEqualStrings("ll-22", s6.items[0]);
+    }
+
+    // Wrong-tag error rollback across all 5 init*Into entry points
+    try F.makeDirty(it, fix.sm_rc);
+    try std.testing.expectError(error.UnexpectedTag, it.initInto(fix.scalar_rc));
+    try F.expectRolledBack(it);
+
+    for ([_]DB.Cursor(.read_only){ fix.hm_rc, fix.al_rc, fix.scalar_rc }) |bad| {
+        try F.makeDirty(it, fix.sm_rc);
+        try std.testing.expectError(error.UnexpectedTag, it.initSortedFromIndexInto(bad, 0));
+        try F.expectRolledBack(it);
+    }
+    for ([_]DB.Cursor(.read_only){ fix.al_rc, fix.scalar_rc }) |bad| {
+        try F.makeDirty(it, fix.sm_rc);
+        try std.testing.expectError(error.UnexpectedTag, it.initSortedFromKeyInto(bad, "a"));
+        try F.expectRolledBack(it);
+    }
+    for ([_]DB.Cursor(.read_only){ fix.ll_rc, fix.scalar_rc }) |bad| {
+        try F.makeDirty(it, fix.sm_rc);
+        try std.testing.expectError(error.UnexpectedTag, it.initArrayListFromIndexInto(bad, 0));
+        try F.expectRolledBack(it);
+    }
+    for ([_]DB.Cursor(.read_only){ fix.al_rc, fix.scalar_rc }) |bad| {
+        try F.makeDirty(it, fix.sm_rc);
+        try std.testing.expectError(error.UnexpectedTag, it.initLinkedArrayListFromIndexInto(bad, 0));
+        try F.expectRolledBack(it);
+    }
+
+    // Mid-walk corrupt leaf rollback, rem >= node.num guard, and pointer/count overflow in isolated DB
+    {
+        var iso_buf = std.Io.Writer.Allocating.init(allocator);
+        defer iso_buf.deinit();
+        var iso_db = try DB.init(std.testing.io, .{ .buffer = &iso_buf, .max_size = 500_000 });
+
+        const IsoSetup = struct {
+            pub fn run(_: @This(), cursor: *DB.Cursor(.read_write)) !void {
+                const rm = try DB.HashMap(.read_write).init(cursor.*);
+                const c_sm = try DB.SortedMap(.read_write).init(try rm.putCursor(hashInt("c_sm")));
+                const clean_sm = try DB.SortedMap(.read_write).init(try rm.putCursor(hashInt("clean_sm")));
+                const rank_oob_sm = try DB.SortedMap(.read_write).init(try rm.putCursor(hashInt("rank_oob_sm")));
+                const mid_sm = try DB.SortedMap(.read_write).init(try rm.putCursor(hashInt("mid_sm")));
+                for (0..N) |i| {
+                    var kbuf: [16]u8 = undefined;
+                    const k = try std.fmt.bufPrint(&kbuf, "k-{d:0>2}", .{i});
+                    try c_sm.put(k, .{ .uint = i });
+                    try clean_sm.put(k, .{ .uint = i });
+                    try rank_oob_sm.put(k, .{ .uint = i });
+                    try mid_sm.put(k, .{ .uint = i });
+                }
+                _ = try DB.ArrayList(.read_write).init(try rm.putCursor(hashInt("iso_e_al")));
+                _ = try DB.LinkedArrayList(.read_write).init(try rm.putCursor(hashInt("iso_e_ll")));
+                _ = try DB.SortedMap(.read_write).init(try rm.putCursor(hashInt("iso_e_sm")));
+                const cyc_hm = try DB.HashMap(.read_write).init(try rm.putCursor(hashInt("cyc_hm")));
+                try cyc_hm.put(0, .{ .uint = 1 });
+            }
+        };
+        try iso_db.runContext(IsoSetup{});
+
+        const iso_root = try DB.HashMap(.read_only).init(iso_db.rootCursor().readOnly());
+        const iso_c_sm_rc = (try iso_root.getCursor(hashInt("c_sm"))).?;
+        const iso_clean_sm_rc = (try iso_root.getCursor(hashInt("clean_sm"))).?;
+        const iso_rank_oob_rc = (try iso_root.getCursor(hashInt("rank_oob_sm"))).?;
+        const iso_mid_sm_rc = (try iso_root.getCursor(hashInt("mid_sm"))).?;
+        const iso_e_al_rc = (try iso_root.getCursor(hashInt("iso_e_al"))).?;
+        const iso_e_ll_rc = (try iso_root.getCursor(hashInt("iso_e_ll"))).?;
+        const iso_e_sm_rc = (try iso_root.getCursor(hashInt("iso_e_sm"))).?;
+        const iso_cyc_hm_rc = (try iso_root.getCursor(hashInt("cyc_hm"))).?;
+
+        const c_sm_branch_off: usize = @intCast(std.mem.readInt(u64, iso_buf.written()[@intCast(iso_c_sm_rc.slot_ptr.slot.value + 8)..][0..8], .big));
+        try std.testing.expectEqual(@as(u8, 1), iso_buf.written()[c_sm_branch_off]);
+        const c_sm_branch_num: usize = iso_buf.written()[c_sm_branch_off + 1];
+        try std.testing.expect(c_sm_branch_num > 0);
+        for (0..c_sm_branch_num) |j| {
+            const slot_off = c_sm_branch_off + 2 + j * 9;
+            const child_val = std.mem.readInt(u64, iso_buf.written()[slot_off + 1 ..][0..8], .big);
+            iso_buf.written()[@intCast(child_val)] = 0xFF;
+        }
+
+        try F.makeDirty(it, iso_clean_sm_rc);
+        try std.testing.expectError(error.InvalidBTreeNodeKind, it.initSortedFromIndexInto(iso_c_sm_rc, 25));
+        try F.expectRolledBack(it);
+        try std.testing.expectError(error.InvalidBTreeNodeKind, Iter.initSortedFromIndex(iso_c_sm_rc, 25));
+
+        // Inflate header.size to 500 and zero branch counts so start_index=300 reaches leaf with rem >= 256
+        std.mem.writeInt(u64, iso_buf.written()[@intCast(iso_rank_oob_rc.slot_ptr.slot.value)..][0..8], 500, .big);
+        const oob_branch_off: usize = @intCast(std.mem.readInt(u64, iso_buf.written()[@intCast(iso_rank_oob_rc.slot_ptr.slot.value + 8)..][0..8], .big));
+        const oob_counts_off = oob_branch_off + 2 + 32 * 9;
+        @memset(iso_buf.written()[oob_counts_off .. oob_counts_off + 16 * 8], 0);
+
+        try F.makeDirty(it, iso_clean_sm_rc);
+        try std.testing.expectError(error.InvalidBTreeNode, it.initSortedFromIndexInto(iso_rank_oob_rc, 300));
+        try F.expectRolledBack(it);
+
+        // Pointer addition overflow (header.root_ptr = maxInt(u64) and CountedHashMap slot.value = maxInt(u64))
+        std.mem.writeInt(u64, iso_buf.written()[@intCast(iso_rank_oob_rc.slot_ptr.slot.value + 8)..][0..8], std.math.maxInt(u64), .big);
+        try F.makeDirty(it, iso_clean_sm_rc);
+        try std.testing.expectError(error.EndOfStream, it.initInto(iso_rank_oob_rc));
+        try F.expectRolledBack(it);
+
+        var chm_overflow_rc = fix.chm_rc;
+        chm_overflow_rc.slot_ptr.slot.value = std.math.maxInt(u64);
+        try F.makeDirty(it, iso_clean_sm_rc);
+        try std.testing.expectError(error.EndOfStream, it.initInto(chm_overflow_rc));
+        try F.expectRolledBack(it);
+
+        // Inflated counts without u64 overflow causing before > total in initSortedFromKeyInto
+        const clean_branch_off: usize = @intCast(std.mem.readInt(u64, iso_buf.written()[@intCast(iso_clean_sm_rc.slot_ptr.slot.value + 8)..][0..8], .big));
+        const clean_counts_off = clean_branch_off + 2 + 32 * 9;
+        std.mem.writeInt(u64, iso_buf.written()[clean_counts_off..][0..8], 50, .big);
+        std.mem.writeInt(u64, iso_buf.written()[clean_counts_off + 8 ..][0..8], 50, .big);
+        try F.makeDirty(it, fix.sm_rc);
+        try std.testing.expectError(error.InvalidBTreeNode, it.initSortedFromKeyInto(iso_clean_sm_rc, "k-39"));
+        try F.expectRolledBack(it);
+
+        // Empty collections with maxInt(u64) root/ptr skip root reads without EndOfStream
+        inline for ([_]DB.Cursor(.read_only){ iso_e_al_rc, iso_e_ll_rc, iso_e_sm_rc }) |erc| {
+            std.mem.writeInt(u64, iso_buf.written()[@intCast(erc.slot_ptr.slot.value + 8)..][0..8], std.math.maxInt(u64), .big);
+            try F.makeDirty(it, fix.sm_rc);
+            try it.initInto(erc);
+            try std.testing.expectEqual(@as(usize, 0), it.core.stack.len);
+            try std.testing.expect((try it.next()) == null);
+        }
+        try F.makeDirty(it, fix.sm_rc);
+        try it.initSortedFromKeyInto(iso_e_sm_rc, "a");
+        try std.testing.expectEqual(@as(usize, 0), it.core.stack.len);
+        try std.testing.expect((try it.next()) == null);
+
+        // Mid-walk error in next() must not advance core.index
+        const mid_branch_off: usize = @intCast(std.mem.readInt(u64, iso_buf.written()[@intCast(iso_mid_sm_rc.slot_ptr.slot.value + 8)..][0..8], .big));
+        const mid_leaf0_off: usize = @intCast(std.mem.readInt(u64, iso_buf.written()[mid_branch_off + 3 ..][0..8], .big));
+        const mid_leaf0_num: usize = iso_buf.written()[mid_leaf0_off + 1];
+        std.mem.writeInt(u64, iso_buf.written()[mid_branch_off + 2 + 9 + 1 ..][0..8], std.math.maxInt(u64), .big);
+        try it.initInto(iso_mid_sm_rc);
+        for (0..mid_leaf0_num) |_| try std.testing.expect((try it.next()) != null);
+        try std.testing.expectEqual(@as(u64, mid_leaf0_num), it.core.index);
+        try std.testing.expectError(error.EndOfStream, it.next());
+        try std.testing.expectEqual(@as(u64, mid_leaf0_num), it.core.index);
+
+        // Cyclic HAMT .index pointer returns KeyOffsetExceeded (not Overflow)
+        const cyc_root_off: usize = @intCast(iso_cyc_hm_rc.slot_ptr.slot.value);
+        const cyc_slot: u72 = @bitCast(xitdb.Slot{ .value = cyc_root_off, .tag = .index });
+        std.mem.writeInt(u72, iso_buf.written()[cyc_root_off..][0..9], cyc_slot, .big);
+        try it.initInto(iso_cyc_hm_rc);
+        try std.testing.expectError(error.KeyOffsetExceeded, it.next());
+
+        // Near-overflow HashMap position returns EndOfStream and rolls back
+        var hm_overflow_rc = fix.hm_rc;
+        hm_overflow_rc.slot_ptr.slot.value = std.math.maxInt(u64) - 10;
+        try F.makeDirty(it, fix.sm_rc);
+        try std.testing.expectError(error.EndOfStream, it.initInto(hm_overflow_rc));
+        try F.expectRolledBack(it);
+    }
+}
+
+test "deep recursive traversal with heap-allocated Iter.initInto on small thread stack" {
+    const allocator = std.testing.allocator;
+    var buffer = std.Io.Writer.Allocating.init(allocator);
+    defer buffer.deinit();
+
+    const DB = xitdb.Database(.memory, HashInt);
+    const Iter = DB.CursorIter;
+    const DEPTH: usize = 40;
+    const SMALL_STACK: usize = 512 * 1024;
+    try std.testing.expect(@sizeOf(Iter) * DEPTH > SMALL_STACK);
+
+    var db = try DB.init(std.testing.io, .{ .buffer = &buffer, .max_size = 500_000 });
+
+    const SetupCtx = struct {
+        pub fn run(_: @This(), cursor: *DB.Cursor(.read_write)) !void {
+            const root_map = try DB.HashMap(.read_write).init(cursor.*);
+            var cur = try root_map.putCursor(hashInt("chain"));
+            for (0..DEPTH) |level| {
+                switch (level % 4) {
+                    0 => {
+                        const hm = try DB.HashMap(.read_write).init(cur);
+                        try hm.put(hashInt("pad"), .{ .uint = level });
+                        cur = try hm.putCursor(hashInt("next"));
+                    },
+                    1 => {
+                        const al = try DB.ArrayList(.read_write).init(cur);
+                        try al.append(.{ .uint = level });
+                        cur = try al.appendCursor();
+                    },
+                    2 => {
+                        const sm = try DB.SortedMap(.read_write).init(cur);
+                        try sm.put("a_pad", .{ .uint = level });
+                        cur = try sm.putCursor("m_next");
+                    },
+                    3 => {
+                        const ll = try DB.LinkedArrayList(.read_write).init(cur);
+                        try ll.append(.{ .uint = level });
+                        cur = try ll.appendCursor();
+                    },
+                    else => unreachable,
+                }
+            }
+            const leaf = try DB.HashMap(.read_write).init(cur);
+            try leaf.put(hashInt("leaf"), .{ .bytes = "bottom" });
+        }
+    };
+    try db.runContext(SetupCtx{});
+
+    const root_ro = try DB.HashMap(.read_only).init(db.rootCursor().readOnly());
+    const chain_rc = (try root_ro.getCursor(hashInt("chain"))).?;
+
+    const IterPool = struct {
+        allocator: std.mem.Allocator,
+        free_list: std.ArrayList(*Iter) = .empty,
+
+        fn deinit(self: *@This()) void {
+            for (self.free_list.items) |it| self.allocator.destroy(it);
+            self.free_list.deinit(self.allocator);
+        }
+
+        fn acquire(self: *@This()) !*Iter {
+            if (self.free_list.pop()) |it| return it;
+            return try self.allocator.create(Iter);
+        }
+
+        fn release(self: *@This(), it: *Iter) void {
+            self.free_list.append(self.allocator, it) catch {
+                self.allocator.destroy(it);
+            };
+        }
+    };
+
+    const Worker = struct {
+        fn traverse(cursor: DB.Cursor(.read_only), pool: *IterPool, depth: usize, leaf_out: *[16]u8, leaf_len: *usize) !void {
+            const slot = try cursor.slot();
+            switch (slot.tag) {
+                .bytes, .short_bytes => {
+                    const s = try cursor.readBytes(leaf_out);
+                    leaf_len.* = s.len;
+                    try std.testing.expectEqual(DEPTH + 1, depth);
+                },
+                .hash_map, .sorted_map, .array_list, .linked_array_list => {
+                    const is_map = slot.tag == .hash_map or slot.tag == .sorted_map;
+                    const it = try pool.acquire();
+                    defer pool.release(it);
+                    try cursor.iteratorInto(it);
+                    while (try it.next()) |elem| {
+                        const next_cur = if (is_map) (try elem.readKeyValuePair()).value_cursor else elem;
+                        try traverse(next_cur, pool, depth + 1, leaf_out, leaf_len);
+                    }
+                },
+                else => {},
+            }
+        }
+
+        fn run(alloc: std.mem.Allocator, start: DB.Cursor(.read_only), worker_err: *?anyerror) void {
+            var pool = IterPool{ .allocator = alloc };
+            defer pool.deinit();
+            var leaf_buf: [16]u8 = undefined;
+            var leaf_len: usize = 0;
+            traverse(start, &pool, 0, &leaf_buf, &leaf_len) catch |err| {
+                worker_err.* = err;
+                return;
+            };
+            if (!std.mem.eql(u8, leaf_buf[0..leaf_len], "bottom")) {
+                worker_err.* = error.TestUnexpectedResult;
+            }
+        }
+    };
+
+    var worker_err: ?anyerror = null;
+    const th = try std.Thread.spawn(.{ .stack_size = SMALL_STACK }, Worker.run, .{ allocator, chain_rc, &worker_err });
+    th.join();
+    if (worker_err) |err| return err;
+}
