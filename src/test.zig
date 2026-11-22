@@ -4366,3 +4366,207 @@ fn testRoots(
         try std.testing.expectEqual(size, try db.committedSize());
     }
 }
+
+test "deep recursive traversal with Iter.initInto on small thread stack" {
+    const allocator = std.testing.allocator;
+    var buffer = std.Io.Writer.Allocating.init(allocator);
+    defer buffer.deinit();
+
+    const DB = xitdb.Database(.memory, HashInt);
+    const Iter = DB.Cursor(.read_only).Iter;
+    const DEPTH: usize = 40;
+    const SMALL_STACK: usize = 512 * 1024;
+    try std.testing.expect(@sizeOf(Iter) * DEPTH > SMALL_STACK);
+
+    var db = try DB.init(std.testing.io, .{ .buffer = &buffer, .max_size = 500_000 });
+
+    const SetupCtx = struct {
+        pub fn run(_: @This(), cursor: *DB.Cursor(.read_write)) !void {
+            const root_map = try DB.HashMap(.read_write).init(cursor.*);
+            var cur = try root_map.putCursor(hashInt("chain"));
+            for (0..DEPTH) |level| {
+                switch (level % 4) {
+                    0 => {
+                        const hm = try DB.HashMap(.read_write).init(cur);
+                        try hm.put(hashInt("pad"), .{ .uint = level });
+                        cur = try hm.putCursor(hashInt("next"));
+                    },
+                    1 => {
+                        const al = try DB.ArrayList(.read_write).init(cur);
+                        try al.append(.{ .uint = level });
+                        cur = try al.appendCursor();
+                    },
+                    2 => {
+                        const sm = try DB.SortedMap(.read_write).init(cur);
+                        try sm.put("a_pad", .{ .uint = level });
+                        cur = try sm.putCursor("m_next");
+                    },
+                    3 => {
+                        const ll = try DB.LinkedArrayList(.read_write).init(cur);
+                        try ll.append(.{ .uint = level });
+                        cur = try ll.appendCursor();
+                    },
+                    else => unreachable,
+                }
+            }
+            const leaf = try DB.HashMap(.read_write).init(cur);
+            try leaf.put(hashInt("leaf"), .{ .bytes = "bottom" });
+        }
+    };
+    try db.runContext(SetupCtx{});
+
+    const root_ro = try DB.HashMap(.read_only).init(db.rootCursor().readOnly());
+    const chain_rc = (try root_ro.getCursor(hashInt("chain"))).?;
+
+    const IterPool = struct {
+        allocator: std.mem.Allocator,
+        free_list: std.ArrayList(*Iter) = .empty,
+
+        fn deinit(self: *@This()) void {
+            for (self.free_list.items) |it| self.allocator.destroy(it);
+            self.free_list.deinit(self.allocator);
+        }
+
+        fn acquire(self: *@This()) !*Iter {
+            if (self.free_list.pop()) |it| return it;
+            return try self.allocator.create(Iter);
+        }
+
+        fn release(self: *@This(), it: *Iter) void {
+            self.free_list.append(self.allocator, it) catch self.allocator.destroy(it);
+        }
+    };
+
+    const Worker = struct {
+        fn traverse(cursor: DB.Cursor(.read_only), pool: *IterPool, depth: usize, leaf_out: *[16]u8, leaf_len: *usize) !void {
+            const slot = try cursor.slot();
+            switch (slot.tag) {
+                .bytes, .short_bytes => {
+                    const s = try cursor.readBytes(leaf_out);
+                    leaf_len.* = s.len;
+                    try std.testing.expectEqual(DEPTH + 1, depth);
+                },
+                .hash_map, .sorted_map, .array_list, .linked_array_list => {
+                    const is_map = slot.tag == .hash_map or slot.tag == .sorted_map;
+                    const it = try pool.acquire();
+                    defer pool.release(it);
+                    try it.initInto(cursor);
+                    while (try it.next()) |elem| {
+                        const next_cur = if (is_map) (try elem.readKeyValuePair()).value_cursor else elem;
+                        try traverse(next_cur, pool, depth + 1, leaf_out, leaf_len);
+                    }
+                },
+                else => {},
+            }
+        }
+
+        fn run(alloc: std.mem.Allocator, start: DB.Cursor(.read_only), worker_err: *?anyerror) void {
+            var pool = IterPool{ .allocator = alloc };
+            defer pool.deinit();
+            var leaf_buf: [16]u8 = undefined;
+            var leaf_len: usize = 0;
+            traverse(start, &pool, 0, &leaf_buf, &leaf_len) catch |err| {
+                worker_err.* = err;
+                return;
+            };
+            if (!std.mem.eql(u8, leaf_buf[0..leaf_len], "bottom")) {
+                worker_err.* = error.TestUnexpectedResult;
+            }
+        }
+    };
+
+    var worker_err: ?anyerror = null;
+    const th = try std.Thread.spawn(.{ .stack_size = SMALL_STACK }, Worker.run, .{ allocator, chain_rc, &worker_err });
+    th.join();
+    if (worker_err) |err| return err;
+}
+
+test "in-place Iter.init*Into reuse and error rollback" {
+    const allocator = std.testing.allocator;
+    var buffer = std.Io.Writer.Allocating.init(allocator);
+    defer buffer.deinit();
+
+    const DB = xitdb.Database(.memory, HashInt);
+    const Iter = DB.Cursor(.read_only).Iter;
+    var db = try DB.init(std.testing.io, .{ .buffer = &buffer, .max_size = 500_000 });
+
+    const SetupCtx = struct {
+        pub fn run(_: @This(), cursor: *DB.Cursor(.read_write)) !void {
+            const root = try DB.HashMap(.read_write).init(cursor.*);
+            try root.put(hashInt("scalar"), .{ .uint = 42 });
+
+            const hm = try DB.HashMap(.read_write).init(try root.putCursor(hashInt("hm")));
+            try hm.put(hashInt("a"), .{ .uint = 1 });
+            try hm.put(hashInt("b"), .{ .uint = 2 });
+
+            const al = try DB.ArrayList(.read_write).init(try root.putCursor(hashInt("al")));
+            try al.append(.{ .uint = 10 });
+            try al.append(.{ .uint = 20 });
+            try al.append(.{ .uint = 30 });
+
+            const sm = try DB.SortedMap(.read_write).init(try root.putCursor(hashInt("sm")));
+            try sm.put("a", .{ .uint = 100 });
+            try sm.put("b", .{ .uint = 200 });
+            try sm.put("c", .{ .uint = 300 });
+
+            const ll = try DB.LinkedArrayList(.read_write).init(try root.putCursor(hashInt("ll")));
+            try ll.append(.{ .uint = 1000 });
+            try ll.append(.{ .uint = 2000 });
+            try ll.append(.{ .uint = 3000 });
+        }
+    };
+    try db.runContext(SetupCtx{});
+
+    var empty_buf = std.Io.Writer.Allocating.init(allocator);
+    defer empty_buf.deinit();
+    var empty_db = try DB.init(std.testing.io, .{ .buffer = &empty_buf, .max_size = 1024 });
+    const none_rc = empty_db.rootCursor().readOnly();
+
+    const root_ro = try DB.HashMap(.read_only).init(db.rootCursor().readOnly());
+    const it = try allocator.create(Iter);
+    defer allocator.destroy(it);
+
+    // Reuse one heap-allocated Iter across all collection families and .none.
+    try it.initInto((try root_ro.getCursor(hashInt("hm"))).?);
+    var hm_count: usize = 0;
+    while (try it.next()) |_| hm_count += 1;
+    try std.testing.expectEqual(@as(usize, 2), hm_count);
+
+    try it.initInto(none_rc);
+    try std.testing.expect((try it.next()) == null);
+
+    // Seek variants (including negative and out-of-range starts).
+    const sm_rc = (try root_ro.getCursor(hashInt("sm"))).?;
+    try it.initSortedFromIndexInto(sm_rc, 1);
+    try std.testing.expectEqual(@as(u64, 200), try (try (try it.next()).?.readKeyValuePair()).value_cursor.readUint());
+    try it.initSortedFromIndexInto(sm_rc, 99);
+    try std.testing.expect((try it.next()) == null);
+
+    try it.initSortedFromKeyInto(sm_rc, "b");
+    try std.testing.expectEqual(@as(u64, 200), try (try (try it.next()).?.readKeyValuePair()).value_cursor.readUint());
+
+    const al_rc = (try root_ro.getCursor(hashInt("al"))).?;
+    try it.initArrayListFromIndexInto(al_rc, -2);
+    try std.testing.expectEqual(@as(u64, 20), try (try it.next()).?.readUint());
+    try it.initArrayListFromIndexInto(al_rc, 99);
+    try std.testing.expect((try it.next()) == null);
+
+    const ll_rc = (try root_ro.getCursor(hashInt("ll"))).?;
+    try it.initLinkedArrayListFromIndexInto(ll_rc, -1);
+    try std.testing.expectEqual(@as(u64, 3000), try (try it.next()).?.readUint());
+    try std.testing.expect((try it.next()) == null);
+
+    // Self-aliasing restart mid-walk restarts cleanly from element 0.
+    try it.initInto(al_rc);
+    try std.testing.expectEqual(@as(u64, 10), try (try it.next()).?.readUint());
+    try it.initInto(it.cursor);
+    try std.testing.expectEqual(@as(u64, 10), try (try it.next()).?.readUint());
+
+    // Failed re-init on a scalar rolls back stale stack/index state cleanly.
+    const scalar_rc = (try root_ro.getCursor(hashInt("scalar"))).?;
+    try std.testing.expectError(error.UnexpectedTag, it.initInto(scalar_rc));
+    try std.testing.expectEqual(@as(u64, 0), it.core.size);
+    try std.testing.expectEqual(@as(u64, 0), it.core.index);
+    try std.testing.expectEqual(@as(usize, 0), it.core.stack.len);
+    try std.testing.expect((try it.next()) == null);
+}
