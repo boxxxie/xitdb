@@ -3593,51 +3593,51 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                         index: u8,
                     };
 
-                    pub fn init(unresolved_cursor: Cursor(write_mode)) !Iter {
-                        const cursor = try unresolved_cursor.resolvedCursor();
-                        return .{
-                            .cursor = cursor,
-                            .core = switch (cursor.slot_ptr.slot.tag) {
-                                .none => .{
-                                    .size = 0,
-                                    .index = 0,
-                                    .stack = try BoundedArray(Level, ITERATOR_STACK_SIZE).init(0),
-                                },
-                                .array_list => blk: {
-                                    const position = cursor.slot_ptr.slot.value;
-                                    var core_reader = cursor.db.core.reader();
-                                    try core_reader.seekTo(position);
-                                    const header: ArrayListHeader = @bitCast(try takeInt(&core_reader.interface, ArrayListHeaderInt, .big));
-                                    break :blk .{
-                                        .size = try cursor.count(),
-                                        .index = 0,
-                                        .stack = try initStack(cursor, header.ptr),
-                                    };
-                                },
-                                .linked_array_list, .sorted_map, .sorted_set => blk: {
-                                    const position = cursor.slot_ptr.slot.value;
-                                    var core_reader = cursor.db.core.reader();
-                                    try core_reader.seekTo(position);
-                                    const header: BTreeHeader = @bitCast(try takeInt(&core_reader.interface, BTreeHeaderInt, .big));
-                                    break :blk .{
-                                        .size = try cursor.count(),
-                                        .index = 0,
-                                        .stack = try initStack(cursor, header.root_ptr + BTREE_NODE_HEADER_SIZE),
-                                    };
-                                },
-                                .hash_map, .hash_set => .{
-                                    .size = 0,
-                                    .index = 0,
-                                    .stack = try initStack(cursor, cursor.slot_ptr.slot.value),
-                                },
-                                .counted_hash_map, .counted_hash_set => .{
-                                    .size = 0,
-                                    .index = 0,
-                                    .stack = try initStack(cursor, cursor.slot_ptr.slot.value + byteSizeOf(u64)),
-                                },
-                                else => return error.UnexpectedTag,
-                            },
+                    fn reset(self: *Iter, db: *Database(db_kind, HashInt), frozen_at: u64) void {
+                        self.cursor = .{
+                            .slot_ptr = .{ .position = null, .slot = .{} },
+                            .db = db,
+                            .frozen_at = frozen_at,
                         };
+                        self.core.size = 0;
+                        self.core.index = 0;
+                        self.core.stack.len = 0;
+                    }
+
+                    pub fn initInto(self: *Iter, unresolved_cursor: Cursor(write_mode)) !void {
+                        const db = unresolved_cursor.db;
+                        const frozen_at = unresolved_cursor.frozen_at;
+                        errdefer self.reset(db, frozen_at);
+
+                        const cursor = try unresolved_cursor.resolvedCursor();
+                        self.reset(db, frozen_at);
+                        self.cursor = cursor;
+                        switch (cursor.slot_ptr.slot.tag) {
+                            .none => {},
+                            .array_list => {
+                                var core_reader = cursor.db.core.reader();
+                                try core_reader.seekTo(cursor.slot_ptr.slot.value);
+                                const header: ArrayListHeader = @bitCast(try takeInt(&core_reader.interface, ArrayListHeaderInt, .big));
+                                self.core.size = header.size;
+                                try fillStack(&self.core.stack, cursor, header.ptr);
+                            },
+                            .linked_array_list, .sorted_map, .sorted_set => {
+                                var core_reader = cursor.db.core.reader();
+                                try core_reader.seekTo(cursor.slot_ptr.slot.value);
+                                const header: BTreeHeader = @bitCast(try takeInt(&core_reader.interface, BTreeHeaderInt, .big));
+                                self.core.size = header.size;
+                                try fillStack(&self.core.stack, cursor, header.root_ptr + BTREE_NODE_HEADER_SIZE);
+                            },
+                            .hash_map, .hash_set => try fillStack(&self.core.stack, cursor, cursor.slot_ptr.slot.value),
+                            .counted_hash_map, .counted_hash_set => try fillStack(&self.core.stack, cursor, cursor.slot_ptr.slot.value + byteSizeOf(u64)),
+                            else => return error.UnexpectedTag,
+                        }
+                    }
+
+                    pub fn init(unresolved_cursor: Cursor(write_mode)) !Iter {
+                        var self: Iter = undefined;
+                        try self.initInto(unresolved_cursor);
+                        return self;
                     }
 
                     fn resolveStartIndex(index: i65, size: u64) ?u64 {
@@ -3647,92 +3647,124 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                         return @intCast(resolved_index);
                     }
 
-                    fn emptyIter(cursor: Cursor(write_mode)) !Iter {
-                        return .{ .cursor = cursor, .core = .{ .size = 0, .index = 0, .stack = try BoundedArray(Level, ITERATOR_STACK_SIZE).init(0) } };
+                    pub fn initSortedFromIndexInto(self: *Iter, unresolved_cursor: Cursor(write_mode), start_index: i65) !void {
+                        const db = unresolved_cursor.db;
+                        const frozen_at = unresolved_cursor.frozen_at;
+                        errdefer self.reset(db, frozen_at);
+
+                        const cursor = try unresolved_cursor.resolvedCursor();
+                        self.reset(db, frozen_at);
+                        self.cursor = cursor;
+                        switch (cursor.slot_ptr.slot.tag) {
+                            // an unwritten map is .none (like iterator()): yield nothing
+                            .none => return,
+                            .sorted_map, .sorted_set => {},
+                            else => return error.UnexpectedTag,
+                        }
+                        const header = try sortedHeader(cursor);
+                        const idx = resolveStartIndex(start_index, header.size) orelse return;
+                        try fillSortedStackFromIndex(&self.core.stack, cursor, header.root_ptr, idx);
+                        self.core.size = header.size;
+                        self.core.index = idx;
                     }
 
                     pub fn initSortedFromIndex(unresolved_cursor: Cursor(write_mode), start_index: i65) !Iter {
+                        var self: Iter = undefined;
+                        try self.initSortedFromIndexInto(unresolved_cursor, start_index);
+                        return self;
+                    }
+
+                    pub fn initSortedFromKeyInto(self: *Iter, unresolved_cursor: Cursor(write_mode), start_key: []const u8) !void {
+                        const db = unresolved_cursor.db;
+                        const frozen_at = unresolved_cursor.frozen_at;
+                        errdefer self.reset(db, frozen_at);
+
                         const cursor = try unresolved_cursor.resolvedCursor();
+                        self.reset(db, frozen_at);
+                        self.cursor = cursor;
                         switch (cursor.slot_ptr.slot.tag) {
-                            // an unwritten map is .none (like iterator()): yield nothing
-                            .none => return emptyIter(cursor),
+                            .none => return,
                             .sorted_map, .sorted_set => {},
                             else => return error.UnexpectedTag,
                         }
-                        const total = try cursor.count();
-                        const idx = resolveStartIndex(start_index, total) orelse return emptyIter(cursor);
-                        const root_ptr = try sortedRootPtr(cursor);
-                        return .{
-                            .cursor = cursor,
-                            .core = .{ .size = total, .index = idx, .stack = try sortedStackFromIndex(cursor, root_ptr, idx) },
-                        };
+                        const header = try sortedHeader(cursor);
+                        const before = try fillSortedStackFromKey(&self.core.stack, cursor, header.root_ptr, start_key);
+                        self.core.size = header.size;
+                        self.core.index = before;
                     }
 
                     pub fn initSortedFromKey(unresolved_cursor: Cursor(write_mode), start_key: []const u8) !Iter {
-                        const cursor = try unresolved_cursor.resolvedCursor();
-                        switch (cursor.slot_ptr.slot.tag) {
-                            .none => return emptyIter(cursor),
-                            .sorted_map, .sorted_set => {},
-                            else => return error.UnexpectedTag,
-                        }
-                        const total = try cursor.count();
-                        const root_ptr = try sortedRootPtr(cursor);
-                        const built = try sortedStackFromKey(cursor, root_ptr, start_key);
-                        return .{
-                            .cursor = cursor,
-                            .core = .{ .size = total, .index = built.before, .stack = built.stack },
-                        };
+                        var self: Iter = undefined;
+                        try self.initSortedFromKeyInto(unresolved_cursor, start_key);
+                        return self;
                     }
 
-                    pub fn initArrayListFromIndex(unresolved_cursor: Cursor(write_mode), start_index: i65) !Iter {
+                    pub fn initArrayListFromIndexInto(self: *Iter, unresolved_cursor: Cursor(write_mode), start_index: i65) !void {
+                        const db = unresolved_cursor.db;
+                        const frozen_at = unresolved_cursor.frozen_at;
+                        errdefer self.reset(db, frozen_at);
+
                         const cursor = try unresolved_cursor.resolvedCursor();
+                        self.reset(db, frozen_at);
+                        self.cursor = cursor;
                         switch (cursor.slot_ptr.slot.tag) {
-                            .none => return emptyIter(cursor),
+                            .none => return,
                             .array_list => {},
                             else => return error.UnexpectedTag,
                         }
                         var core_reader = cursor.db.core.reader();
                         try core_reader.seekTo(cursor.slot_ptr.slot.value);
                         const header: ArrayListHeader = @bitCast(try takeInt(&core_reader.interface, ArrayListHeaderInt, .big));
-                        const idx = resolveStartIndex(start_index, header.size) orelse return emptyIter(cursor);
+                        const idx = resolveStartIndex(start_index, header.size) orelse return;
                         const last_key = header.size - 1;
                         const shift: u6 = @intCast(if (last_key < SLOT_COUNT) 0 else std.math.log(u64, SLOT_COUNT, last_key));
-                        return .{
-                            .cursor = cursor,
-                            .core = .{ .size = header.size, .index = idx, .stack = try arrayListStackFromIndex(cursor, header.ptr, idx, shift) },
-                        };
+                        try fillArrayListStackFromIndex(&self.core.stack, cursor, header.ptr, idx, shift);
+                        self.core.size = header.size;
+                        self.core.index = idx;
                     }
 
-                    pub fn initLinkedArrayListFromIndex(unresolved_cursor: Cursor(write_mode), start_index: i65) !Iter {
+                    pub fn initArrayListFromIndex(unresolved_cursor: Cursor(write_mode), start_index: i65) !Iter {
+                        var self: Iter = undefined;
+                        try self.initArrayListFromIndexInto(unresolved_cursor, start_index);
+                        return self;
+                    }
+
+                    pub fn initLinkedArrayListFromIndexInto(self: *Iter, unresolved_cursor: Cursor(write_mode), start_index: i65) !void {
+                        const db = unresolved_cursor.db;
+                        const frozen_at = unresolved_cursor.frozen_at;
+                        errdefer self.reset(db, frozen_at);
+
                         const cursor = try unresolved_cursor.resolvedCursor();
+                        self.reset(db, frozen_at);
+                        self.cursor = cursor;
                         switch (cursor.slot_ptr.slot.tag) {
-                            .none => return emptyIter(cursor),
+                            .none => return,
                             .linked_array_list => {},
                             else => return error.UnexpectedTag,
                         }
                         var core_reader = cursor.db.core.reader();
                         try core_reader.seekTo(cursor.slot_ptr.slot.value);
                         const header: BTreeHeader = @bitCast(try takeInt(&core_reader.interface, BTreeHeaderInt, .big));
-                        const idx = resolveStartIndex(start_index, header.size) orelse return emptyIter(cursor);
-                        return .{
-                            .cursor = cursor,
-                            .core = .{ .size = header.size, .index = idx, .stack = try btreeStackFromIndex(cursor, header.root_ptr, idx) },
-                        };
+                        const idx = resolveStartIndex(start_index, header.size) orelse return;
+                        try fillBTreeStackFromIndex(&self.core.stack, cursor, header.root_ptr, idx);
+                        self.core.size = header.size;
+                        self.core.index = idx;
                     }
 
-                    fn sortedRootPtr(cursor: Cursor(write_mode)) !u64 {
-                        switch (cursor.slot_ptr.slot.tag) {
-                            .sorted_map, .sorted_set => {},
-                            else => return error.UnexpectedTag,
-                        }
+                    pub fn initLinkedArrayListFromIndex(unresolved_cursor: Cursor(write_mode), start_index: i65) !Iter {
+                        var self: Iter = undefined;
+                        try self.initLinkedArrayListFromIndexInto(unresolved_cursor, start_index);
+                        return self;
+                    }
+
+                    fn sortedHeader(cursor: Cursor(write_mode)) !BTreeHeader {
+                        std.debug.assert(cursor.slot_ptr.slot.tag == .sorted_map or cursor.slot_ptr.slot.tag == .sorted_set);
                         var core_reader = cursor.db.core.reader();
                         try core_reader.seekTo(cursor.slot_ptr.slot.value);
-                        const header: BTreeHeader = @bitCast(try takeInt(&core_reader.interface, BTreeHeaderInt, .big));
-                        return header.root_ptr;
+                        return @bitCast(try takeInt(&core_reader.interface, BTreeHeaderInt, .big));
                     }
 
-                    fn sortedStackFromIndex(cursor: Cursor(write_mode), root_ptr: u64, start_index: u64) !BoundedArray(Level, ITERATOR_STACK_SIZE) {
-                        var stack = try BoundedArray(Level, ITERATOR_STACK_SIZE).init(0);
+                    fn fillSortedStackFromIndex(stack: *BoundedArray(Level, ITERATOR_STACK_SIZE), cursor: Cursor(write_mode), root_ptr: u64, start_index: u64) !void {
                         var node_ptr = root_ptr;
                         var rem = start_index;
                         while (true) {
@@ -3742,7 +3774,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                                 .leaf => {
                                     if (rem >= node.num) return error.InvalidBTreeNode;
                                     try stack.append(.{ .position = position, .block = node.entries, .index = @intCast(rem) });
-                                    return stack;
+                                    return;
                                 },
                                 .branch => {
                                     var i: u8 = 0;
@@ -3756,8 +3788,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                         }
                     }
 
-                    fn sortedStackFromKey(cursor: Cursor(write_mode), root_ptr: u64, key: []const u8) !struct { stack: BoundedArray(Level, ITERATOR_STACK_SIZE), before: u64 } {
-                        var stack = try BoundedArray(Level, ITERATOR_STACK_SIZE).init(0);
+                    fn fillSortedStackFromKey(stack: *BoundedArray(Level, ITERATOR_STACK_SIZE), cursor: Cursor(write_mode), root_ptr: u64, key: []const u8) !u64 {
                         var node_ptr = root_ptr;
                         var before: u64 = 0;
                         while (true) {
@@ -3768,7 +3799,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                                     const search = try cursor.db.sortedLeafSearch(&node, key);
                                     before += search.index;
                                     try stack.append(.{ .position = position, .block = node.entries, .index = search.index });
-                                    return .{ .stack = stack, .before = before };
+                                    return before;
                                 },
                                 .branch => {
                                     const i = try cursor.db.sortedBranchSearch(&node, key);
@@ -3783,15 +3814,14 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     // descend the array-list radix trie to `start_index`, pushing one
                     // Level per tier with its index set to that tier's child slot.
                     // nextInternal then walks forward from there.
-                    fn arrayListStackFromIndex(cursor: Cursor(write_mode), root_ptr: u64, start_index: u64, shift: u6) !BoundedArray(Level, ITERATOR_STACK_SIZE) {
-                        var stack = try BoundedArray(Level, ITERATOR_STACK_SIZE).init(0);
+                    fn fillArrayListStackFromIndex(stack: *BoundedArray(Level, ITERATOR_STACK_SIZE), cursor: Cursor(write_mode), root_ptr: u64, start_index: u64, shift: u6) !void {
                         var pos = root_ptr;
                         var sh = shift;
                         while (true) {
                             const block = try readSlotBlock(cursor, pos);
                             const i: u8 = @intCast(start_index >> (sh * BIT_COUNT) & MASK);
                             try stack.append(.{ .position = pos, .block = block, .index = i });
-                            if (sh == 0) return stack;
+                            if (sh == 0) return;
                             // every tier above the leaf is a populated .index slot for
                             // any start_index < size, so this child always exists
                             pos = block[i].value;
@@ -3800,9 +3830,8 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     }
 
                     // descend the linked-array-list count b-tree to `start_index`; the
-                    // positional analog of sortedStackFromIndex (no separator keys).
-                    fn btreeStackFromIndex(cursor: Cursor(write_mode), root_ptr: u64, start_index: u64) !BoundedArray(Level, ITERATOR_STACK_SIZE) {
-                        var stack = try BoundedArray(Level, ITERATOR_STACK_SIZE).init(0);
+                    // positional analog of fillSortedStackFromIndex (no separator keys).
+                    fn fillBTreeStackFromIndex(stack: *BoundedArray(Level, ITERATOR_STACK_SIZE), cursor: Cursor(write_mode), root_ptr: u64, start_index: u64) !void {
                         var node_ptr = root_ptr;
                         var rem = start_index;
                         while (true) {
@@ -3812,7 +3841,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                                 .leaf => {
                                     if (rem >= node.num) return error.InvalidBTreeNode;
                                     try stack.append(.{ .position = position, .block = node.values, .index = @intCast(rem) });
-                                    return stack;
+                                    return;
                                 },
                                 .branch => {
                                     var i: u8 = 0;
@@ -3862,19 +3891,17 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                         return index_block;
                     }
 
-                    fn initStack(cursor: Cursor(write_mode), position: u64) !BoundedArray(Level, ITERATOR_STACK_SIZE) {
-                        var stack = try BoundedArray(Level, ITERATOR_STACK_SIZE).init(0);
+                    fn fillStack(stack: *BoundedArray(Level, ITERATOR_STACK_SIZE), cursor: Cursor(write_mode), position: u64) !void {
                         try stack.append(.{
                             .position = position,
                             .block = try readSlotBlock(cursor, position),
                             .index = 0,
                         });
-                        return stack;
                     }
 
                     fn nextInternal(self: *Iter, comptime node_offset: u64) !?Cursor(.read_only) {
                         while (self.core.stack.slice().len > 0) {
-                            const level = self.core.stack.slice()[self.core.stack.slice().len - 1];
+                            const level = &self.core.stack.slice()[self.core.stack.slice().len - 1];
                             if (level.index == level.block.len) {
                                 _ = self.core.stack.pop();
                                 if (self.core.stack.slice().len > 0) {
@@ -3893,7 +3920,8 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                                     });
                                     continue;
                                 } else {
-                                    self.core.stack.slice()[self.core.stack.slice().len - 1].index += 1;
+                                    const position = level.position + (level.index * byteSizeOf(Slot));
+                                    level.index += 1;
                                     // normally a slot that is .none should be skipped because it doesn't
                                     // have a value, but if it's set to full, then it is actually a valid
                                     // item that should be returned.
@@ -3901,7 +3929,6 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                                         // counted only once found, so an error can't
                                         // leave the index ahead of the stack
                                         self.core.index += 1;
-                                        const position = level.position + (level.index * byteSizeOf(Slot));
                                         return .{
                                             .slot_ptr = .{ .position = position, .slot = next_slot },
                                             .db = self.cursor.db,
@@ -3918,7 +3945,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                 };
 
                 pub fn iterator(self: Cursor(write_mode)) !Iter {
-                    return try Iter.init(self);
+                    return Iter.init(self);
                 }
             };
         }
@@ -3962,7 +3989,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                 }
 
                 pub fn iterator(self: HashMap(write_mode)) !Cursor(write_mode).Iter {
-                    return try self.cursor.iterator();
+                    return self.cursor.iterator();
                 }
 
                 pub fn getCursor(self: HashMap(write_mode), hash: HashInt) !?Cursor(.read_only) {
@@ -4063,7 +4090,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                 }
 
                 pub fn iterator(self: CountedHashMap(write_mode)) !Cursor(write_mode).Iter {
-                    return try self.map.iterator();
+                    return self.map.iterator();
                 }
 
                 pub fn getCursor(self: CountedHashMap(write_mode), hash: HashInt) !?Cursor(.read_only) {
@@ -4133,7 +4160,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                 }
 
                 pub fn iterator(self: HashSet(write_mode)) !Cursor(write_mode).Iter {
-                    return try self.cursor.iterator();
+                    return self.cursor.iterator();
                 }
 
                 pub fn getCursor(self: HashSet(write_mode), hash: HashInt) !?Cursor(.read_only) {
@@ -4202,7 +4229,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                 }
 
                 pub fn iterator(self: CountedHashSet(write_mode)) !Cursor(write_mode).Iter {
-                    return try self.set.iterator();
+                    return self.set.iterator();
                 }
 
                 pub fn getCursor(self: CountedHashSet(write_mode), hash: HashInt) !?Cursor(.read_only) {
@@ -4259,15 +4286,15 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                 }
 
                 pub fn iterator(self: SortedMap(write_mode)) !Cursor(write_mode).Iter {
-                    return try self.cursor.iterator();
+                    return self.cursor.iterator();
                 }
 
                 pub fn iteratorFrom(self: SortedMap(write_mode), start_key: []const u8) !Cursor(write_mode).Iter {
-                    return try Cursor(write_mode).Iter.initSortedFromKey(self.cursor, start_key);
+                    return Cursor(write_mode).Iter.initSortedFromKey(self.cursor, start_key);
                 }
 
                 pub fn iteratorFromIndex(self: SortedMap(write_mode), start_index: i65) !Cursor(write_mode).Iter {
-                    return try Cursor(write_mode).Iter.initSortedFromIndex(self.cursor, start_index);
+                    return Cursor(write_mode).Iter.initSortedFromIndex(self.cursor, start_index);
                 }
 
                 pub fn getCursor(self: SortedMap(write_mode), key: []const u8) !?Cursor(.read_only) {
@@ -4363,15 +4390,15 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                 }
 
                 pub fn iterator(self: SortedSet(write_mode)) !Cursor(write_mode).Iter {
-                    return try self.map.iterator();
+                    return self.map.iterator();
                 }
 
                 pub fn iteratorFrom(self: SortedSet(write_mode), start_key: []const u8) !Cursor(write_mode).Iter {
-                    return try self.map.iteratorFrom(start_key);
+                    return self.map.iteratorFrom(start_key);
                 }
 
                 pub fn iteratorFromIndex(self: SortedSet(write_mode), start_index: i65) !Cursor(write_mode).Iter {
-                    return try self.map.iteratorFromIndex(start_index);
+                    return self.map.iteratorFromIndex(start_index);
                 }
 
                 pub fn put(self: SortedSet(.read_write), key: []const u8) !void {
@@ -4430,11 +4457,11 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                 }
 
                 pub fn iterator(self: ArrayList(write_mode)) !Cursor(write_mode).Iter {
-                    return try self.cursor.iterator();
+                    return self.cursor.iterator();
                 }
 
                 pub fn iteratorFrom(self: ArrayList(write_mode), index: i65) !Cursor(write_mode).Iter {
-                    return try Cursor(write_mode).Iter.initArrayListFromIndex(self.cursor, index);
+                    return Cursor(write_mode).Iter.initArrayListFromIndex(self.cursor, index);
                 }
 
                 pub fn getCursor(self: ArrayList(write_mode), index: i65) !?Cursor(.read_only) {
@@ -4521,11 +4548,11 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                 }
 
                 pub fn iterator(self: LinkedArrayList(write_mode)) !Cursor(write_mode).Iter {
-                    return try self.cursor.iterator();
+                    return self.cursor.iterator();
                 }
 
                 pub fn iteratorFrom(self: LinkedArrayList(write_mode), index: i65) !Cursor(write_mode).Iter {
-                    return try Cursor(write_mode).Iter.initLinkedArrayListFromIndex(self.cursor, index);
+                    return Cursor(write_mode).Iter.initLinkedArrayListFromIndex(self.cursor, index);
                 }
 
                 pub fn getCursor(self: LinkedArrayList(write_mode), index: i65) !?Cursor(.read_only) {
@@ -5385,7 +5412,7 @@ fn BoundedArray(comptime T: type, comptime buffer_capacity: usize) type {
             return self.slice();
         }
 
-        pub fn get(self: Self, i: usize) T {
+        pub fn get(self: *const Self, i: usize) T {
             return self.constSlice()[i];
         }
 
@@ -5393,7 +5420,7 @@ fn BoundedArray(comptime T: type, comptime buffer_capacity: usize) type {
             self.slice()[i] = item;
         }
 
-        pub fn ensureUnusedCapacity(self: Self, additional_count: usize) error{Overflow}!void {
+        pub fn ensureUnusedCapacity(self: *const Self, additional_count: usize) error{Overflow}!void {
             if (self.len + additional_count > buffer_capacity) {
                 return error.Overflow;
             }
